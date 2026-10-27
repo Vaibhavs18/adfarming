@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TraceRecord",
+  "description": "One record per tool/model call, for the reviewable decision log.",
+  "type": "object",
+  "required": ["run_id", "step", "tool", "started_at", "duration_ms", "status"],
+  "properties": {
+    "run_id": {"type": "string"},
+    "step": {"type": "integer"},
+    "tool": {"type": "string", "description": "e.g. muse-spark, muse-image, sam-3.1, ffmpeg"},
+    "input_hash": {"type": "string"},
+    "output_hash": {"type": "string"},
+    "artifact_paths": {"type": "array", "items": {"type": "string"}},
+    "cost_usd": {"type": "number"},
+    "decision": {"type": "string", "description": "Why the agent chose this cut/concept"},
+    "overridden_by_human": {"type": "boolean"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "duration_ms": {"type": "integer"},
+    "status": {"enum": ["ok", "error", "skipped"]}
+  }
+}

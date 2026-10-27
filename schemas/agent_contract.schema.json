@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentContract",
+  "description": "Message passed between agent roles. Every handoff is one of these.",
+  "type": "object",
+  "required": ["run_id", "step", "from_role", "to_role", "input", "output", "created_at"],
+  "properties": {
+    "run_id": {"type": "string"},
+    "step": {"type": "integer", "minimum": 1},
+    "from_role": {"enum": ["planner", "copywriter", "visualizer", "segmenter", "assembler", "qc"]},
+    "to_role": {"enum": ["planner", "copywriter", "visualizer", "segmenter", "assembler", "qc", "human"]},
+    "input": {"type": "object"},
+    "output": {"type": "object"},
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}
