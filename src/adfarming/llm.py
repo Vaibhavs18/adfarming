@@ -1,6 +1,7 @@
 """Model calls. Primary: Meta Model API (Muse Spark 1.3). Fallback: Muse Spark Open via Baseten."""
 import base64
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -13,7 +14,19 @@ META = "https://api.meta.ai/v1"
 
 
 def _env() -> dict:
-    return dict(l.strip().split("=", 1) for l in (ROOT / ".env").read_text().splitlines() if "=" in l)
+    """Keys come from .env if present, else from the process environment (Docker/CI)."""
+    env = {}
+    f = ROOT / ".env"
+    if f.exists():
+        for l in f.read_text().splitlines():
+            l = l.strip()
+            if l and not l.startswith("#") and "=" in l:
+                k, v = l.split("=", 1)
+                env[k.strip()] = v.strip().strip("'\"")
+    for k in ("META_MODEL_API_KEY", "BASETEN_API_KEY", "BASETEN_MODEL"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    return env
 
 
 def _hdr() -> dict:
@@ -21,10 +34,16 @@ def _hdr() -> dict:
 
 
 def _extract_json(text: str) -> dict:
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        raise ValueError(f"no JSON in model output: {text[:200]!r}")
-    return json.loads(m.group(0))
+    """First decodable JSON object in the text (tolerates prose and stray braces around it)."""
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", text):
+        try:
+            obj, _ = dec.raw_decode(text[m.start():])
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise ValueError(f"no JSON in model output: {text[:200]!r}")
 
 
 def spark_json(system: str, user: str, effort: str = "low", max_out: int = 8000) -> tuple[dict, dict]:

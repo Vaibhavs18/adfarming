@@ -1,4 +1,5 @@
 """Assembler agent: concept beats -> speech-snapped master -> 9:16 / 1:1 / 16:9 with captions and hook text."""
+import os
 import re
 import subprocess
 import time
@@ -10,14 +11,22 @@ from .footage import PRIV
 from .llm import spark_json
 from .trace import Run
 
-FONT = "/System/Library/Fonts/Kohinoor.ttc"  # shapes Devanagari + Latin
+ROOT = Path(__file__).resolve().parents[2]
+FONT_DIR = ROOT / "assets/fonts"
+_KOHINOOR = "/System/Library/Fonts/Kohinoor.ttc"  # macOS fallback; shapes Devanagari + Latin in one face
+DEVA_FONT = next((f for f in (os.getenv("ADF_FONT", ""), str(FONT_DIR / "NotoSansDevanagari-Medium.ttf"), _KOHINOOR)
+                  if f and Path(f).exists()), str(FONT_DIR / "NotoSansDevanagari-Medium.ttf"))
+# Noto Sans Devanagari has no Latin glyphs, so Latin runs use Noto Sans (both bundled, OFL). Kohinoor needs no split.
+LATIN_FONT = DEVA_FONT if DEVA_FONT == _KOHINOOR or not (FONT_DIR / "NotoSans-Medium.ttf").exists() \
+    else str(FONT_DIR / "NotoSans-Medium.ttf")
+FONT = DEVA_FONT  # kept for callers/tests that read it
 SIZES = {"9x16": (1080, 1920), "1x1": (1080, 1080), "16x9": (1920, 1080)}
 CAP_Y = {"9x16": 0.70, "1x1": 0.72, "16x9": 0.76}   # caption top as fraction of height
 TITLE_Y = {"9x16": 0.09, "1x1": 0.06, "16x9": 0.07}
 CAP_W = {"9x16": 0.88, "1x1": 0.88, "16x9": 0.60}   # max text width as fraction of width
 CAP_PT = {"9x16": 62, "1x1": 58, "16x9": 60}
 TITLE_PT = {"9x16": 58, "1x1": 52, "16x9": 54}
-SNAP_WINDOW = 1.2
+SNAP_WINDOW = 0.6
 HOLD_S = 2.0  # clean end hold: last frame + CTA only, no speech
 
 
@@ -37,9 +46,17 @@ def speech_intervals(clip: dict) -> list[tuple[float, float]]:
     p = subprocess.run(["ffmpeg", "-v", "info", "-i", str(PRIV / "footage" / f), "-vn",
                         "-af", "silencedetect=noise=-32dB:d=0.12", "-f", "null", "-"],
                        capture_output=True, text=True)
-    starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", p.stderr)]
-    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", p.stderr)]
-    sil = list(zip(starts, ends + [clip["duration_s"]] * (len(starts) - len(ends))))
+    num = r"(-?[\d.]+(?:e-?\d+)?)"
+    sil, open_s = [], None
+    for m in re.finditer(rf"silence_(start|end): {num}", p.stderr):  # sequential pairing, tolerates negatives
+        v = max(0.0, float(m.group(2)))
+        if m.group(1) == "start":
+            open_s = v
+        elif open_s is not None:
+            sil.append((open_s, v))
+            open_s = None
+    if open_s is not None:
+        sil.append((open_s, clip["duration_s"]))
     out, cur = [], 0.0
     for s, e in sil:
         if s - cur > 0.05:
@@ -51,7 +68,7 @@ def speech_intervals(clip: dict) -> list[tuple[float, float]]:
     return out
 
 
-DANGLING = {"and", "but", "so", "or", "the", "a", "to", "एंड", "बट", "सो", "और", "या", "का", "के", "की"}
+DANGLING = {"and", "but", "so", "or", "एंड", "बट", "सो", "और", "या"}  # not to/a/the/ka/ke/ki: valid Hinglish endings
 
 
 def word_times(clip: dict, turn: dict) -> list[tuple[str, float, float]]:
@@ -69,8 +86,12 @@ def word_times(clip: dict, turn: dict) -> list[tuple[str, float, float]]:
             sec -= b - a
         return segs[-1][1]
 
-    n = len(words)
-    return [(w, at(total * i / n), at(total * (i + 1) / n)) for i, w in enumerate(words)]
+    wts = [len(w) + 1 for w in words]  # weight by word length, not just count
+    cum, acc = [0], 0
+    for x in wts:
+        acc += x
+        cum.append(acc)
+    return [(w, at(total * cum[i] / acc), at(total * cum[i + 1] / acc)) for i, w in enumerate(words)]
 
 
 def trim_dangling(run: Run, concept: dict, clips: dict[str, dict]) -> None:
@@ -162,11 +183,41 @@ def title_items(concept: dict) -> list[dict]:
 
 
 # ---------- rendering ----------
-def _wrap(d: ImageDraw.ImageDraw, text: str, font, maxw: int) -> list[str]:
+_DEVA = re.compile(r"[\u0900-\u097F\u200c\u200d]")
+
+
+class Face:
+    """Draws mixed Devanagari + Latin text by switching font per script run."""
+
+    def __init__(self, size: int):
+        self.deva = ImageFont.truetype(DEVA_FONT, size, index=0)
+        self.latin = ImageFont.truetype(LATIN_FONT, size, index=0)
+
+    def runs(self, text: str) -> list[tuple[str, ImageFont.FreeTypeFont]]:
+        out: list[tuple[str, ImageFont.FreeTypeFont]] = []
+        for ch in text:
+            f = self.deva if _DEVA.match(ch) else (out[-1][1] if out and not ch.isalnum() else self.latin)
+            if out and out[-1][1] is f:
+                out[-1] = (out[-1][0] + ch, f)
+            else:
+                out.append((ch, f))
+        return out
+
+    def length(self, d: ImageDraw.ImageDraw, text: str) -> float:
+        return sum(d.textlength(t, font=f) for t, f in self.runs(text))
+
+    def draw(self, d: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, **kw) -> None:
+        x, y = xy[0], xy[1] + self.latin.getmetrics()[0]  # common baseline across both fonts
+        for t, f in self.runs(text):
+            d.text((x, y), t, font=f, anchor="ls", **kw)
+            x += d.textlength(t, font=f)
+
+
+def _wrap(d: ImageDraw.ImageDraw, text: str, font: Face, maxw: int) -> list[str]:
     lines, cur = [], ""
     for w in text.split():
         trial = f"{cur} {w}".strip()
-        if d.textlength(trial, font=font) <= maxw or not cur:
+        if font.length(d, trial) <= maxw or not cur:
             cur = trial
         else:
             lines.append(cur)
@@ -176,29 +227,29 @@ def _wrap(d: ImageDraw.ImageDraw, text: str, font, maxw: int) -> list[str]:
 
 def render_caption(text: str, ratio: str, path: Path) -> None:
     W, _ = SIZES[ratio]
-    font = ImageFont.truetype(FONT, CAP_PT[ratio])
+    font = Face(CAP_PT[ratio])
     d = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     lines, lh = _wrap(d, text, font, int(W * CAP_W[ratio])), int(CAP_PT[ratio] * 1.55)
     im = Image.new("RGBA", (W, lh * len(lines) + 20), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
     for i, line in enumerate(lines):
-        d.text(((W - d.textlength(line, font=font)) / 2, 6 + i * lh), line, font=font,
-               fill="white", stroke_width=5, stroke_fill="black")
+        font.draw(d, ((W - font.length(d, line)) / 2, 6 + i * lh), line,
+                  fill="white", stroke_width=5, stroke_fill="black")
     im.save(path)
 
 
 def render_title(text: str, ratio: str, path: Path) -> None:
     W, _ = SIZES[ratio]
-    font = ImageFont.truetype(FONT, TITLE_PT[ratio])
+    font = Face(TITLE_PT[ratio])
     d = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     lines, lh = _wrap(d, text, font, int(W * 0.78)), int(TITLE_PT[ratio] * 1.5)
-    tw = int(max(d.textlength(l, font=font) for l in lines)) + 64
+    tw = int(max(font.length(d, l) for l in lines)) + 64
     im = Image.new("RGBA", (W, lh * len(lines) + 40), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
     x0 = (W - tw) // 2
     d.rounded_rectangle([x0, 4, x0 + tw, lh * len(lines) + 30], radius=28, fill=(15, 15, 15, 200))
     for i, line in enumerate(lines):
-        d.text(((W - d.textlength(line, font=font)) / 2, 14 + i * lh), line, font=font, fill="white")
+        font.draw(d, ((W - font.length(d, line)) / 2, 14 + i * lh), line, fill="white")
     im.save(path)
 
 
@@ -263,7 +314,7 @@ def build(run: Run, concept: dict, clips: list[dict], track=None) -> dict:
     m = master(run, concept, work)
     stats = track(m) if track else None
     if stats and stats.get("frames"):
-        crop_y = max(0, min(840, int(stats["top_frac"] * 1920 - 0.14 * 1080)))
+        crop_y = max(0, min(840, int(stats.get("top_q15", stats["top_frac"]) * 1920 - 0.20 * 1080)))
         crop_why = f"SAM 3.1 head-top at {stats['top_frac']:.0%} of height, so square crop starts y={crop_y}"
     else:
         crop_y, crop_why = 160, "fixed y=160 crop (SAM unavailable)"

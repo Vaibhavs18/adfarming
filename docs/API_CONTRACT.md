@@ -1,0 +1,55 @@
+# Studio API contract (JSON + SSE)
+
+Single source of truth for the backend (`src/adfarming/web.py`) and the UI (`web/index.html`, `web/app.js`).
+All routes except `/healthz`, `/api/login` and static files need the session cookie set by `/api/login`. All JSON uses snake_case.
+Artifact URLs in responses are relative and ready to use, e.g. `/api/runs/{id}/artifacts/c2_9x16.mp4`.
+
+## Auth and health
+- `GET /healthz` -> `{"ok": true}` (no auth, no paid calls)
+- `POST /api/login {"password": str}` -> 200 sets cookie `adf_session`; 401 on wrong password. Password from env `STUDIO_PASSWORD`.
+- `GET /api/me` -> `{"ok": true}` or 401 (lets the UI show the login form)
+
+## Clients and memory
+- `GET /api/clients` -> `[{"id": "dharaa", "name": "Dharaa by Smriti"}]`
+- `GET /api/clients/{cid}/memory?status=approved|proposed|all` -> `[MemoryItem]`
+- `POST /api/clients/{cid}/memory {"kind": str, "text": str, "pinned": bool?}` -> `MemoryItem` (human-sourced, approved)
+- `PATCH /api/clients/{cid}/memory/{id} {"text": str}` -> `MemoryItem` (supersedes the old row)
+- `POST /api/clients/{cid}/memory/{id}/decide {"decision": "accept"|"reject", "note": str?}` -> `MemoryItem`
+- `MemoryItem` = `{"id": str, "kind": "brand_voice|hard_rule|performance|asset|preference|rejection", "text": str, "source": "human|agent_inferred", "status": "proposed|approved|rejected|superseded", "pinned": bool, "evidence": object|null, "created_at": str}`
+
+## Runs
+- `POST /api/runs {"client_id": str, "goal": str?}` -> `{"run_id": str}` (server-generated uuid; starts the agent loop)
+- `GET /api/runs` -> `[{"run_id", "client_id", "status", "current_step", "created_at", "cost_usd"}]`
+- `GET /api/runs/{id}` -> `RunState`
+- `POST /api/runs/{id}/answer {"gate": int, "action": "approve|steer|edit|back", "text": str?, "choice": str?, "fields": object?, "reason": str?, "to": str?}` -> 202 `{"status": "accepted"}`; 409 if the gate is not the pending one; 422 on invalid action. `choice` = concept id on the ideas gate. `to` = step name for back.
+- `POST /api/runs/{id}/cancel` -> 202
+- `GET /api/runs/{id}/log` -> `[{"seq": int, "ts": str, "step": str|null, "kind": str, "actor": "human|agent|system", "text": str, "cost_usd": float|null, "memory_ids": [str]}]` (plain-language decision log)
+- `GET /api/runs/{id}/artifacts/{name}` -> file (mp4 with HTTP Range, json, webp, zip). Whitelist: names that exist directly under the run's output dir; no `/`, no `..`; never anything from `private/`.
+- `GET /api/runs/{id}/events` -> SSE (`Last-Event-ID` resume). Event names: `commentary` `{"text"}`, `tool_started` `{"tool"}`, `tool_done` `{"tool","usd"}`, `card_ready` `{"gate","step"}`, `cost_update` `{"usd","cap_usd"}`, `run_status` `{"status"}`, `error` `{"message"}`. UI refetches `GET /api/runs/{id}` on `card_ready`/`run_status`.
+
+## RunState
+```json
+{
+  "run_id": "uuid", "client_id": "dharaa",
+  "status": "running|awaiting_human|interrupted|done|error|cancelled",
+  "current_step": "brief|ideas|preview|edit|check|ship",
+  "steps": [{"name": "brief", "state": "done|current|pending|stale"}],
+  "gate": null,
+  "memory_in_play": [MemoryItem],
+  "artifacts": {"concepts": [Concept]|null, "frames": [url], "cuts": {"9x16": url, "1x1": url, "16x9": url}|null, "captions": [{"start":0.0,"end":1.7,"text":"..."}], "qc": {"pass": true, "score": 5, "issues": [], "fixes": [], "summary": ""}|null, "zip": url|null},
+  "cost": {"usd": 0.31, "cap_usd": 1.5, "by_tool": {"muse-spark": 0.01}},
+  "commentary": [{"ts": "...", "text": "..."}]
+}
+```
+`gate` when a person must act: `{"id": int, "step": str, "card": Card}`. `Concept` = `{"id","title","angle","hook","beats":[{"clip","src_in","src_out","purpose","on_screen_text"}],"cta","length_s","why_it_fits","risks","cites":[memory_id]}`.
+
+## Cards (one per step; `card.type` = step name)
+- `brief`: `{"type":"brief","text": str,"memory_cited":[id],"cost_estimate_usd": float}` actions: approve, steer(text), edit(fields.text)
+- `ideas`: `{"type":"ideas","concepts":[Concept],"recommended": id|null,"cost_estimate_usd": float}` actions: approve with `choice`, steer(text), edit(fields: hook/cta per concept), reject via steer with `reason`
+- `preview`: `{"type":"preview","frames":[url],"cost_estimate_usd": float}` (cost of the NEXT paid step) actions: approve, steer, back
+- `edit`: `{"type":"edit","beats":[...],"captions":[...],"hook": str,"cta": str,"cost_estimate_usd": float}` actions: approve, steer, edit(fields: hook, cta, captions[i].text), back
+- `check`: `{"type":"check","verdict":{...},"history":[{"attempt":1,"score":2,"pass":false,"summary":""}],"proposed_fixes":[str]}` actions: approve (accept result), steer (apply fixes), back
+- `ship`: `{"type":"ship","cuts":{...},"zip": url,"memory_proposals":[MemoryItem]}` actions: approve (finish), back. Memory proposals are decided through the memory endpoints.
+
+## Errors
+`{"error": {"code": str, "message": str}}` with proper HTTP status. Paid tool blocked by gate -> 409 code `gate_blocked`. Cost cap hit -> 402 code `cost_cap`.

@@ -7,8 +7,8 @@
   "properties": {
     "run_id": {"type": "string"},
     "step": {"type": "integer", "minimum": 1},
-    "from_role": {"enum": ["planner", "copywriter", "visualizer", "segmenter", "assembler", "qc"]},
-    "to_role": {"enum": ["planner", "copywriter", "visualizer", "segmenter", "assembler", "qc", "human"]},
+    "from_role": {"enum": ["planner", "copywriter", "visualizer", "segmenter", "assembler", "qc", "human", "orchestrator", "memory"]},
+    "to_role": {"enum": ["planner", "copywriter", "visualizer", "segmenter", "assembler", "qc", "human", "orchestrator", "memory"]},
     "input": {"type": "object"},
     "output": {"type": "object"},
     "created_at": {"type": "string", "format": "date-time"}

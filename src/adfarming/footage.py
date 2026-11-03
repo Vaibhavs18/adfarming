@@ -1,11 +1,12 @@
 """Clip metadata + Meta Voice Transcribe turns (cached under private/asr/)."""
 import json
+import os
 import subprocess
 from pathlib import Path
 
 from .llm import ROOT, transcribe_wav
 
-PRIV = ROOT / "private"
+PRIV = Path(os.getenv("ADF_PRIVATE", str(ROOT / "private")))  # Docker: /data (footage/, asr/, brief.md ...)
 
 
 def duration(path: Path) -> float:

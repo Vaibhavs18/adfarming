@@ -19,34 +19,48 @@ COST_PER_FRAME_USD = 0.0002  # listed $0.20 / 1k frames; 50-frame minimum per re
 def track(run: Run, video: Path, prompt: str = "woman") -> dict:
     """Returns {frames, top_frac, bottom_frac, boxes:[(frame,x1,y1,x2,y2,w,h)]} for the largest match per frame."""
     t0 = time.time()
-    small = Path(tempfile.mkdtemp()) / "sam_in.mp4"
-    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vf", "scale=540:-2", "-an", "-c:v", "libx264",
-                    "-crf", "26", "-preset", "veryfast", "-movflags", "+faststart", str(small)], check=True)
-    up = requests.post(META + "/files", headers=_hdr(), data={"purpose": "user_data"}, timeout=180,
-                       files={"file": ("clip.mp4", small.open("rb"), "video/mp4")})
-    up.raise_for_status()
-    fid = up.json()["id"]
-    r = requests.post(META + "/responses", headers={**_hdr(), "Content-Type": "application/json",
-                                                     "Accept": "text/event-stream"},
-                      stream=True, timeout=400, json={
-        "model": "sam-3.1", "stream": True, "metadata": {"mask_encoding": "one_bit"},
-        "input": [{"type": "message", "role": "user", "content": [
-            {"type": "input_text", "text": prompt}, {"type": "input_video", "file_id": fid}]}]})
-    r.raise_for_status()
+    fid = None
     best: dict[int, tuple] = {}
-    for raw in r.iter_lines():
-        s = raw.decode("utf-8", "replace")
-        if not s.startswith("data: "):
-            continue
-        if s[6:] == "[DONE]":
-            break
-        ev = json.loads(s[6:])
-        if ev.get("type") != "response.output_text.delta":
-            continue
-        for m in BOX.finditer(ev["delta"]):
-            f, x1, y1, x2, y2, w, h = map(int, m.groups())
-            if f not in best or (x2 - x1) * (y2 - y1) > (best[f][3] - best[f][1]) * (best[f][4] - best[f][2]):
-                best[f] = (f, x1, y1, x2, y2, w, h)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            small = Path(td) / "sam_in.mp4"
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vf", "scale=540:-2", "-an", "-c:v", "libx264",
+                            "-crf", "26", "-preset", "veryfast", "-movflags", "+faststart", str(small)], check=True)
+            with small.open("rb") as fh:
+                up = requests.post(META + "/files", headers=_hdr(), data={"purpose": "user_data"}, timeout=180,
+                                   files={"file": ("clip.mp4", fh, "video/mp4")})
+            up.raise_for_status()
+            fid = up.json()["id"]
+        r = requests.post(META + "/responses", headers={**_hdr(), "Content-Type": "application/json",
+                                                         "Accept": "text/event-stream"},
+                          stream=True, timeout=400, json={
+            "model": "sam-3.1", "stream": True, "metadata": {"mask_encoding": "one_bit"},
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": prompt}, {"type": "input_video", "file_id": fid}]}]})
+        r.raise_for_status()
+        for raw in r.iter_lines():
+            s = raw.decode("utf-8", "replace")
+            if not s.startswith("data: "):
+                continue
+            if s[6:] == "[DONE]":
+                break
+            ev = json.loads(s[6:])
+            if ev.get("type") != "response.output_text.delta":
+                continue
+            for m in BOX.finditer(ev["delta"]):
+                f, x1, y1, x2, y2, w, h = map(int, m.groups())
+                if f not in best or (x2 - x1) * (y2 - y1) > (best[f][3] - best[f][1]) * (best[f][4] - best[f][2]):
+                    best[f] = (f, x1, y1, x2, y2, w, h)
+    except Exception as e:  # SAM failure degrades to the fixed crop, never kills the run
+        run.trace("sam-3.1", {"prompt": prompt}, {"error": f"{type(e).__name__}: {str(e)[:100]}"}, started=t0,
+                  status="error", decision="SAM failed; falling back to fixed crop")
+        return {"frames": 0}
+    finally:
+        if fid:  # client footage should not linger on the provider side (best effort)
+            try:
+                requests.delete(META + f"/files/{fid}", headers=_hdr(), timeout=30)
+            except Exception:
+                pass
     if not best:
         run.trace("sam-3.1", {"prompt": prompt}, {"frames": 0}, started=t0, status="error",
                   decision="no matches returned; falling back to fixed crop")
@@ -54,7 +68,9 @@ def track(run: Run, video: Path, prompt: str = "woman") -> dict:
     boxes = [best[k] for k in sorted(best)]
     top = statistics.median(b[2] / b[6] for b in boxes)
     bottom = statistics.median(b[4] / b[6] for b in boxes)
-    out = {"frames": len(boxes), "top_frac": top, "bottom_frac": bottom, "prompt": prompt}
+    tops = [b[2] / b[6] for b in boxes]
+    q15 = statistics.quantiles(tops, n=20)[2] if len(tops) >= 2 else tops[0]
+    out = {"frames": len(boxes), "top_frac": top, "top_q15": q15, "bottom_frac": bottom, "prompt": prompt}
     run.trace("sam-3.1", {"prompt": prompt, "file": video.name}, out, started=t0,
               cost_usd=round(max(len(boxes), 50) * COST_PER_FRAME_USD, 4),
               decision=f"tracked '{prompt}' on {len(boxes)} frames; head top at median {top:.0%} of frame height")

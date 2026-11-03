@@ -1,0 +1,14 @@
+.venv
+out
+private
+.env
+.env.*
+.git
+.gitignore
+__pycache__
+*.pyc
+*.mov
+*.mp4
+footage
+node_modules
+.DS_Store

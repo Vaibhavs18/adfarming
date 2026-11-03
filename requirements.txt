@@ -1,0 +1,5 @@
+# Runtime deps actually imported by src/ and scripts/ (versions as installed in .venv, 2026-11-03)
+pillow==13.0.0
+requests==2.34.2
+openai==3.42.1
+jsonschema==4.26.0

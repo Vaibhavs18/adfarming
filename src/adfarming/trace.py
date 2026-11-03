@@ -1,15 +1,18 @@
 """Trace records and agent contracts, validated against schemas/ and written as JSONL."""
 import hashlib
 import json
+import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[2]
-_TRACE = Draft202012Validator(json.loads((ROOT / "schemas/trace_record.schema.json").read_text()))
-_CONTRACT = Draft202012Validator(json.loads((ROOT / "schemas/agent_contract.schema.json").read_text()))
+_TRACE = Draft202012Validator(json.loads((ROOT / "schemas/trace_record.schema.json").read_text()), format_checker=FormatChecker())
+_CONTRACT = Draft202012Validator(json.loads((ROOT / "schemas/agent_contract.schema.json").read_text()),
+                                 format_checker=FormatChecker())
 
 
 def digest(obj) -> str:
@@ -23,10 +26,13 @@ def now() -> str:
 
 class Run:
     def __init__(self, run_id: str, out_dir: Path | None = None):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", run_id):
+            raise ValueError(f"invalid run_id {run_id!r}")
         self.run_id = run_id
-        self.dir = (out_dir or ROOT / "out") / run_id
+        self.dir = (out_dir or Path(os.getenv("ADF_OUT", str(ROOT / "out")))) / run_id
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.step = 0
+        tf = self.dir / "trace.jsonl"
+        self.step = sum(1 for _ in tf.open()) if tf.exists() else 0
 
     def _append(self, name: str, record: dict, validator: Draft202012Validator):
         validator.validate(record)

@@ -40,14 +40,26 @@ def clips_block(clips: list[dict]) -> str:
 
 def validate(concepts: list[dict], clips: list[dict]) -> None:
     dur = {c["file"]: c["duration_s"] for c in clips}
+    ids = [c["id"] for c in concepts]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"duplicate concept ids: {ids}")
     for c in concepts:
+        if not c["beats"]:
+            raise ValueError(f"{c['id']}: no beats")
         for b in c["beats"]:
+            b.setdefault("purpose", "")
+            b.setdefault("visual_note", "")
             if b["clip"] not in dur:
                 raise ValueError(f"{c['id']}: unknown clip {b['clip']!r}")
             b["src_in"], b["src_out"] = float(b["src_in"]), float(b["src_out"])
             if not (0 <= b["src_in"] < b["src_out"] <= dur[b["clip"]] + 0.05):
                 raise ValueError(f"{c['id']}: bad range {b['src_in']}-{b['src_out']} in {b['clip']}")
             b["src_out"] = min(b["src_out"], dur[b["clip"]])
+            if not 1.5 <= b["src_out"] - b["src_in"] <= 10:
+                raise ValueError(f"{c['id']}: beat length {b['src_out'] - b['src_in']:.1f}s outside 1.5-10s")
+        total = sum(b["src_out"] - b["src_in"] for b in c["beats"])
+        if not 10 <= total <= 27:
+            raise ValueError(f"{c['id']}: total length {total:.1f}s outside 10-27s")
         spans = sorted((b["clip"], b["src_in"], b["src_out"]) for b in c["beats"])
         for (c1, a1, z1), (c2, a2, z2) in zip(spans, spans[1:]):
             if c1 == c2 and a2 < z1:
@@ -63,7 +75,7 @@ def generate(run: Run, brief: str, clips: list[dict], refs: str, attempts: int =
         try:
             concepts = out["concepts"]
             validate(concepts, clips)
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             last = str(e)
             run.trace("muse-spark", {"attempt": i + 1}, {"error": last}, started=t0, status="error",
                       decision=f"validation failed, retrying: {last}")
@@ -109,7 +121,7 @@ def revise(run: Run, brief: str, concept: dict, verdict: dict, clips: list[dict]
             new = out["concept"]
             new["id"] = concept["id"]
             validate([new], clips)
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, TypeError) as e:
             last = str(e)
             continue
         run.trace("muse-spark", {"qc_issues": verdict.get("issues", [])}, out, started=t0,
