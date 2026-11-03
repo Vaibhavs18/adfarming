@@ -8,3 +8,4 @@ footage/
 *.mov
 *.mp4
 private/
+data/
