@@ -1,0 +1,41 @@
+{
+  "clients": [{"id": "demo_saree", "name": "Demo Saree Brand"}],
+  "memory": [
+    {"id":"m1","kind":"hard_rule","text":"No hard-sell and no fake urgency (no 'only today', no countdowns).","source":"human","status":"approved","pinned":true,"evidence":null,"created_at":"2026-05-01T10:00:00Z"},
+    {"id":"m2","kind":"hard_rule","text":"Never invent prices or discounts. Only show prices the client gave us.","source":"human","status":"approved","pinned":true,"evidence":null,"created_at":"2026-05-01T10:01:00Z"},
+    {"id":"m3","kind":"brand_voice","text":"Warm, first person, a little Hinglish. Sounds like a friend, not a catalogue.","source":"human","status":"approved","pinned":false,"evidence":null,"created_at":"2026-05-01T10:02:00Z"},
+    {"id":"m4","kind":"brand_voice","text":"Say 'handloom' and 'weaver' with respect. Never 'cheap' or 'budget'.","source":"human","status":"approved","pinned":false,"evidence":null,"created_at":"2026-05-01T10:03:00Z"},
+    {"id":"m5","kind":"performance","text":"Wedding-season posts did well last year, especially behind-the-loom clips.","source":"agent_inferred","status":"approved","pinned":false,"evidence":{"quote":"Wedding reel got 3x saves vs average","source_run":"demo-r2"},"created_at":"2026-05-02T09:00:00Z"},
+    {"id":"m6","kind":"preference","text":"End on a calm call to action card with the shop name, held for 2 seconds.","source":"human","status":"approved","pinned":false,"evidence":null,"created_at":"2026-05-02T09:10:00Z"},
+    {"id":"m7","kind":"asset","text":"Clips named loom_* and drape_* are cleared for use. Model faces are not.","source":"human","status":"approved","pinned":false,"evidence":null,"created_at":"2026-05-02T09:20:00Z"},
+    {"id":"m8","kind":"rejection","text":"Avoid generic 'festive sale' framing. It felt off-brand last time.","source":"agent_inferred","status":"approved","pinned":false,"evidence":{"quote":"too salesy, not us","source_run":"demo-r1"},"created_at":"2026-05-03T09:00:00Z"}
+  ],
+  "brief_text": "Make a 20 to 30 second vertical ad for the new handloom cotton collection, aimed at women planning for the wedding season. Lead with the craft (the loom, the weaver's hands), keep the voice warm and first person, and end on a quiet shop-name card. No prices, no urgency.",
+  "memory_cited_brief": ["m1","m2","m3","m5","m6"],
+  "concepts": [
+    {"id":"c1","title":"The weaver's morning","angle":"Story","hook":"Meri nani ka saree banane mein 11 din lagte hain.","beats":[
+      {"clip":"loom_01.mp4","src_in":2.0,"src_out":6.5,"purpose":"Open on the loom in motion","on_screen_text":"11 din ka kaam"},
+      {"clip":"loom_03.mp4","src_in":0.0,"src_out":4.0,"purpose":"Close-up of hands","on_screen_text":""},
+      {"clip":"drape_02.mp4","src_in":1.0,"src_out":5.0,"purpose":"Finished drape","on_screen_text":"Ab aapke liye"}],
+     "cta":"Demo Saree Brand, handloom ghar tak","length_s":28,"why_it_fits":"Slow, warm story in her own voice. Matches the craft-first brief.","risks":"Slightly long for a feed ad.","cites":["m3","m4","m5"]},
+    {"id":"c2","title":"The reveal","angle":"Reveal","hook":"Yeh saree shaadi mein pehni, aur sabne poocha kahan se?","beats":[
+      {"clip":"drape_01.mp4","src_in":0.0,"src_out":3.5,"purpose":"Open on the finished drape","on_screen_text":"Kahan se?"},
+      {"clip":"loom_02.mp4","src_in":1.0,"src_out":5.0,"purpose":"Cut back to the loom","on_screen_text":"Haath se bunaa"},
+      {"clip":"drape_03.mp4","src_in":2.0,"src_out":6.0,"purpose":"Twirl at the wedding","on_screen_text":""}],
+     "cta":"Demo Saree Brand","length_s":20,"why_it_fits":"Uses the wedding-season angle that performed well, no pressure to buy.","risks":"Hook is a little long.","cites":["m1","m3","m5","m6"]},
+    {"id":"c3","title":"Proof in the thread","angle":"Proof","hook":"Ek dhaaga, ek kahani. Dekhiye kaise banta hai.","beats":[
+      {"clip":"loom_04.mp4","src_in":0.0,"src_out":4.0,"purpose":"Thread close-up","on_screen_text":"Ek dhaaga"},
+      {"clip":"loom_01.mp4","src_in":6.5,"src_out":10.0,"purpose":"Wide loom shot","on_screen_text":""},
+      {"clip":"drape_02.mp4","src_in":0.0,"src_out":3.0,"purpose":"Fabric movement","on_screen_text":"Ek kahani"},
+      {"clip":"drape_01.mp4","src_in":4.0,"src_out":7.0,"purpose":"Final look","on_screen_text":""}],
+     "cta":"Demo Saree Brand, handloom","length_s":25,"why_it_fits":"Gentle proof of craft without claims. Respects the hard rules.","risks":"Less emotional than c1 or c2.","cites":["m2","m4","m7"]}
+  ],
+  "captions": [
+    {"start":0.0,"end":1.8,"text":"Yeh saree shaadi mein pehni..."},
+    {"start":1.8,"end":3.4,"text":"aur sabne poocha, kahan se?"},
+    {"start":3.4,"end":5.6,"text":"Haath se bunaa, 11 din mein."},
+    {"start":5.6,"end":7.2,"text":"Ek dhaaga, ek kahani."}
+  ],
+  "qc_fail": {"pass": false, "score": 3, "issues": ["The call to action card text is small on the 9:16 cut.", "Caption 3 appears about half a second late.", "The hook text covers part of the weaver's hands."], "fixes": ["Make the end card text larger.", "Start caption 3 earlier.", "Move the hook text to the top third."], "summary": "Close, but three small things to fix before it goes to the client."},
+  "qc_pass": {"pass": true, "score": 5, "issues": [], "fixes": [], "summary": "Clean cut. The end card reads clearly and captions land on the beat."}
+}
