@@ -464,6 +464,21 @@ class Toolbox:
         self._write("working_concept.json",
                     {"from_gate": st["step_approval"]["ideas"]["gate_id"], "concept": concept})
 
+    def _lock_fields(self, cid: str, fields: dict) -> None:
+        """Remember fields a human edited so no automatic revision can overwrite them."""
+        d = self._read("human_locks.json") or {}
+        d.setdefault(cid, {}).update(fields)
+        self._write("human_locks.json", d)
+
+    def _freeze(self, concept: dict) -> dict:
+        """Re-apply human-edited hook/cta/title to a concept (human edits always win)."""
+        locks = (self._read("human_locks.json") or {}).get(concept.get("id"), {})
+        for k, v in locks.items():
+            concept[k] = v
+        if "hook" in locks and concept.get("beats"):
+            concept["beats"][0]["on_screen_text"] = locks["hook"]
+        return concept
+
     def _stale(self, names_steps: list[tuple[str, str]]) -> None:
         st = self.state()
         for name, step in names_steps:
@@ -620,7 +635,8 @@ class Toolbox:
             brief += "\n\nCLIENT HARD RULES (QC must verify):\n" + hard
         mark0 = self._trace_mark()
         res = best_of_rounds(
-            self.run, wc, self.clips(), brief, build=self.b.build, review=self.b.review, revise=self.b.revise,
+            self.run, self._freeze(wc), self.clips(), brief, build=self.b.build, review=self.b.review,
+            revise=lambda *a, **k: self._freeze(self.b.revise(*a, **k)),
             track=self._safe_track(a.get("subject_prompt") or "woman"),
             max_rounds=int(a.get("max_rounds") or 3),
             budget_ok=lambda: self.spent() + self._cost_since(mark0) + 0.10 <= run_cap_usd())
@@ -844,12 +860,16 @@ class Toolbox:
             ignored += [k for k in fields if k != "text"]
         elif step in ("ideas", "edit"):
             def put(c: dict) -> None:
+                locked = {}
                 for k in ("hook", "cta", "title"):
                     if k in fields and isinstance(fields[k], str):
                         c[k] = fields[k]
+                        locked[k] = fields[k]
                         applied.append(k)
                 if "hook" in fields and c.get("beats"):
                     c["beats"][0]["on_screen_text"] = fields["hook"]
+                if locked:
+                    self._lock_fields(c["id"], locked)
             if step == "ideas":
                 cs = self.concepts_list()
                 tid = fields.get("concept_id") or payload.get("choice") or payload.get("concept_id")

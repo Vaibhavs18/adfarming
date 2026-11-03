@@ -327,3 +327,27 @@ def test_edit_answer_is_applied_verbatim_and_marks_cuts_stale():
     assert wc["hook"] == "My own hook" and wc["cta"] == "Visit the site" and wc["beats"][0]["on_screen_text"] == "My own hook"
     assert media.builds == 2 and "steer_not_applied" not in json.dumps(client2.requests[1]["input"])
     assert '"answer":"edited"' in json.dumps(client2.requests[0]["input"]).replace(" ", "").replace("\\", "")
+
+
+def test_human_edited_hook_and_cta_survive_qc_auto_revise():
+    """Regression: QC auto-revise rewrote a human-edited cta/hook (found in the real HTTP e2e)."""
+    run = new_run()
+    fail = {"pass": False, "score": 2, "issues": ["hook weak"], "fixes": ["change hook"], "summary": "no"}
+    ok = {"pass": True, "score": 5, "issues": [], "fixes": [], "summary": "good"}
+    media = FakeMedia(verdicts=[ok, fail])       # first build passes; the REBUILD after the human edit fails round 1
+    built, orig = [], media.build
+    media.build = lambda run_, concept, clips, track=None: (built.append((concept["hook"], concept["cta"])),
+                                                           orig(run_, concept, clips, track))[1]
+    loop, client, _ = loop_for(script_for("brief", "ideas", "preview", "edit"), media)
+    for k, p in [("approve", {}), ("approve", {"choice": "c2"}), ("approve", {})]:
+        loop.advance(run); human(run, k, **p)
+    loop.advance(run)
+    human(run, "edit", fields={"hook": "My own hook", "cta": "Visit the site"})
+    loop2, _, _ = loop_for([[("ask_human", {"summary": "again"})], [("build_cuts", {})],
+                            [("ask_human", {"summary": "rebuilt"})]], media)
+    built.clear()
+    loop2.advance(run)
+    assert len(built) >= 2, "QC failure should have triggered a second round"
+    assert all(b == ("My own hook", "Visit the site") for b in built), built
+    wc = Toolbox(run, media.backends()).working_concept()
+    assert wc["hook"] == "My own hook" and wc["cta"] == "Visit the site"
