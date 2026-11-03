@@ -45,11 +45,16 @@ Artifact URLs in responses are relative and ready to use, e.g. `/api/runs/{id}/a
 
 ## Cards (one per step; `card.type` = step name)
 - `brief`: `{"type":"brief","text": str,"memory_cited":[id],"cost_estimate_usd": float}` actions: approve, steer(text), edit(fields.text)
-- `ideas`: `{"type":"ideas","concepts":[Concept],"recommended": id|null,"cost_estimate_usd": float}` actions: approve with `choice`, steer(text), edit(fields: hook/cta per concept), reject via steer with `reason`
+- `ideas`: `{"type":"ideas","concepts":[Concept],"recommended": id|null,"cost_estimate_usd": float}` actions: approve with `choice` (if omitted, defaults to `recommended`; unknown choice -> 422), steer(text), edit(fields: `{concept_id?, hook?, cta?}`; no concept_id means the chosen/recommended concept), reject via steer with `reason`
 - `preview`: `{"type":"preview","frames":[url],"cost_estimate_usd": float}` (cost of the NEXT paid step) actions: approve, steer, back
 - `edit`: `{"type":"edit","beats":[...],"captions":[...],"hook": str,"cta": str,"cost_estimate_usd": float}` actions: approve, steer, edit(fields: hook, cta, captions[i].text), back
 - `check`: `{"type":"check","verdict":{...},"history":[{"attempt":1,"score":2,"pass":false,"summary":""}],"proposed_fixes":[str]}` actions: approve (accept result), steer (apply fixes), back
 - `ship`: `{"type":"ship","cuts":{...},"zip": url,"memory_proposals":[MemoryItem]}` actions: approve (finish), back. Memory proposals are decided through the memory endpoints.
 
 ## Errors
+Extra codes (implemented in web.py): 409 `busy` (another run is running), 409 `gate_not_pending`, 409 `not_proposed` / `not_editable` (memory routes), 429 `session_run_limit` (over 5 runs per session), 429 `rate_limited` (login), 404 `run_not_found` / `client_not_found` / `memory_not_found`.
 `{"error": {"code": str, "message": str}}` with proper HTTP status. Paid tool blocked by gate -> 409 code `gate_blocked`. Cost cap hit -> 402 code `cost_cap`.
+
+## Implementation notes
+- `POST /api/runs` returns 200. `current_step` stays `ship` after a run finishes (status `done`). A cancelled run has `gate: null`.
+- Run status is stored as `run_status` events; any real runner must call `runner.set_status` the same way and do slow work in a thread, returning after `set_status('running')`.
