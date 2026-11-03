@@ -37,12 +37,17 @@ def render(run_dir: Path, picked: str | None, meta: dict) -> Path:
                  f"<p class=mut><b>Risk:</b> {e(c['risks'])}</p></div>")
     o.append("</div>")
     if meta.get("frames"):
-        o.append("<h2>Storyboard preview (Muse Image)</h2><div class=row>" +
+        o.append("<h2>Storyboard preview (Muse Image, AI-generated stand-in, not the real talent)</h2><div class=row>" +
                  "".join(f"<img src='{e(f)}' width=200>" for f in meta["frames"]) + "</div>")
     if meta.get("cuts"):
         o.append("<h2>Final cuts</h2><div class=row>" + "".join(
             f"<div><div class=mut>{e(r)}</div><video controls preload=metadata src='{e(f)}' "
             f"height={320 if r != '16x9' else 220}></video></div>" for r, f in meta["cuts"].items()) + "</div>")
+    if meta.get("qc"):
+        q = meta["qc"]
+        o.append(f"<h2>QC (Muse Wonder)</h2><div class=card><b>{'PASS' if q.get('pass') else 'FAIL'}</b> · score {e(q.get('score'))}/5"
+                 f"<p>{e(q.get('summary', ''))}</p><p class=mut><b>Issues:</b> {e('; '.join(q.get('issues', [])) or 'none')}</p>"
+                 f"<p class=mut><b>Fixes:</b> {e('; '.join(q.get('fixes', [])) or 'none')}</p></div>")
     o.append("<h2>Decision trace</h2><table><tr><th>#<th>Tool<th>Decision<th>ms<th>$<th>Status</tr>")
     for t in trace:
         o.append(f"<tr><td>{t['step']}<td>{e(t['tool'])}<td>{e(t.get('decision', ''))}<td>{t['duration_ms']}"

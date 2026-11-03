@@ -10,7 +10,7 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / "src"))
-from adfarming import concepts as C, cuts, storyboard, viewer  # noqa: E402
+from adfarming import concepts as C, cuts, qc, sam, storyboard, viewer  # noqa: E402
 from adfarming.footage import PRIV, load_clips  # noqa: E402
 from adfarming.trace import Run  # noqa: E402
 
@@ -39,7 +39,19 @@ if a.pick:
     brand = (PRIV / "subject.txt").read_text().strip() if (PRIV / "subject.txt").exists() else "an Indian woman in a saree"
     if not a.no_storyboard:
         meta["frames"] = storyboard.frames(run, concept, brand)
-    meta.update(cuts.build(run, concept, clips))
+    brief = (PRIV / "brief.md").read_text()
+    history = []
+    for attempt in range(1, 4):
+        meta.update(cuts.build(run, concept, clips, track=lambda m: sam.track(run, Path(m))))
+        verdict = qc.review(run, brief, concept, meta["captions"], run.dir / meta["cuts"]["9x16"])
+        history.append({"attempt": attempt, "score": verdict.get("score"), "pass": verdict.get("pass"),
+                        "summary": verdict.get("summary")})
+        meta["qc"], meta["qc_history"] = verdict, history
+        if verdict.get("pass") or attempt == 3:
+            break
+        concept = C.revise(run, brief, concept, verdict, clips)
+        cs = [concept if c["id"] == concept["id"] else c for c in cs]
+        cfile.write_text(json.dumps(cs, ensure_ascii=False, indent=2))
     (run.dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 page = viewer.render(run.dir, a.pick, meta)
 print(f"\nreview page: {page}")

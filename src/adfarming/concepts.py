@@ -19,7 +19,7 @@ REFERENCE ADS (long-running winners in this niche)
 
 Write 3 DIFFERENT concepts (different angles). Each must address the gap: awareness worked, conversion did not.
 Build each as an edit: 2-4 beats, each beat a src_in/src_out range (seconds, inside the clip's duration, 2-9s long)
-taken from the clips so the spoken words support the hook. Total length 12-25s.
+taken from the clips so the spoken words support the hook. Total length 12-25s. Never reuse the same moment twice; ranges from one clip must not overlap. Do not end on a half-finished sentence, and the cta is shown as an end card.
 JSON shape:
 {{"concepts":[{{
   "id":"c1","title":"...","angle":"story|proof|objection|offer",
@@ -48,6 +48,10 @@ def validate(concepts: list[dict], clips: list[dict]) -> None:
             if not (0 <= b["src_in"] < b["src_out"] <= dur[b["clip"]] + 0.05):
                 raise ValueError(f"{c['id']}: bad range {b['src_in']}-{b['src_out']} in {b['clip']}")
             b["src_out"] = min(b["src_out"], dur[b["clip"]])
+        spans = sorted((b["clip"], b["src_in"], b["src_out"]) for b in c["beats"])
+        for (c1, a1, z1), (c2, a2, z2) in zip(spans, spans[1:]):
+            if c1 == c2 and a2 < z1:
+                raise ValueError(f"{c['id']}: beats overlap inside {c1} ({a1}-{z1} vs {a2}-{z2}); use non-overlapping ranges")
 
 
 def generate(run: Run, brief: str, clips: list[dict], refs: str, attempts: int = 3) -> list[dict]:
@@ -70,3 +74,46 @@ def generate(run: Run, brief: str, clips: list[dict], refs: str, attempts: int =
         run.contract("copywriter", "human", {"brief": brief}, out)
         return concepts
     raise RuntimeError(f"concepts failed validation {attempts}x: {last}")
+
+
+REVISE = """You are re-editing ONE ad concept after QC rejected it.
+
+BRIEF
+{brief}
+
+CURRENT CONCEPT
+{concept}
+
+QC ISSUES
+{issues}
+QC FIXES SUGGESTED
+{fixes}
+
+AVAILABLE CLIPS (spoken turns [start-end s] text)
+{clips}
+
+Return ONLY JSON: {{"concept": {{same shape as the current concept, with corrected beats/hook/cta}}}}.
+Rules: ranges must be inside each clip and must not overlap; every beat must start and end on a complete phrase;
+never end on an unfinished sentence or a stutter (the clip's final words may be unfinished, so stop before them);
+the cta is shown as a soft end card. Keep length 12-25s."""
+
+
+def revise(run: Run, brief: str, concept: dict, verdict: dict, clips: list[dict]) -> dict:
+    prompt = REVISE.format(brief=brief, concept=concept, issues="\n".join(verdict.get("issues", [])),
+                           fixes="\n".join(verdict.get("fixes", [])), clips=clips_block(clips))
+    last = None
+    for i in range(3):
+        t0 = time.time()
+        out, usage = chat_json(SYSTEM, prompt + (f"\n\nFIX THIS ERROR: {last}" if last else ""))
+        try:
+            new = out["concept"]
+            new["id"] = concept["id"]
+            validate([new], clips)
+        except (KeyError, ValueError) as e:
+            last = str(e)
+            continue
+        run.trace("muse-spark", {"qc_issues": verdict.get("issues", [])}, out, started=t0,
+                  decision=f"re-edit after QC score {verdict.get('score')}: {len(new['beats'])} beats; {usage['model']}")
+        run.contract("copywriter", "assembler", {"qc": verdict}, out)
+        return new
+    raise RuntimeError(f"revision failed validation: {last}")
