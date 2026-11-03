@@ -1,34 +1,78 @@
-"""Muse Spark Open via Baseten (OpenAI-compatible). Swap base_url/model for the Meta Model API later."""
+"""Model calls. Primary: Meta Model API (Muse Spark 1.3). Fallback: Muse Spark Open via Baseten."""
+import base64
 import json
 import re
+import time
 from pathlib import Path
 
+import requests
 from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parents[2]
+META = "https://api.meta.ai/v1"
 
 
 def _env() -> dict:
     return dict(l.strip().split("=", 1) for l in (ROOT / ".env").read_text().splitlines() if "=" in l)
 
 
-def client_and_model():
-    env = _env()
-    return (OpenAI(api_key=env["BASETEN_API_KEY"], base_url="https://inference.baseten.co/v1"),
-            env["BASETEN_MODEL"])
+def _hdr() -> dict:
+    return {"Authorization": "Bearer " + _env()["META_MODEL_API_KEY"]}
 
 
-def chat_json(system: str, user: str, max_tokens: int = 12000) -> tuple[dict, dict]:
-    """Returns (parsed_json, usage). Model output may be wrapped in code fences."""
-    client, model = client_and_model()
-    r = client.chat.completions.create(
-        model=model, max_tokens=max_tokens, temperature=0.7,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-    text = r.choices[0].message.content or ""
-    if not text:
-        raise ValueError(f"empty content, finish_reason={r.choices[0].finish_reason}, "
-                         f"usage={r.usage.model_dump()}")
-    m =re.search(r"\{.*\}", text, re.S)
+def _extract_json(text: str) -> dict:
+    m = re.search(r"\{.*\}", text, re.S)
     if not m:
         raise ValueError(f"no JSON in model output: {text[:200]!r}")
-    return json.loads(m.group(0)), r.usage.model_dump()
+    return json.loads(m.group(0))
+
+
+def spark_json(system: str, user: str, effort: str = "low", max_out: int = 8000) -> tuple[dict, dict]:
+    """Muse Spark 1.3 via /v1/responses. Returns (json, {model, tokens})."""
+    r = requests.post(META + "/responses", headers=_hdr(), timeout=180, json={
+        "model": "muse-spark-1.3", "instructions": system, "input": user,
+        "max_output_tokens": max_out, "reasoning": {"effort": effort}})
+    r.raise_for_status()
+    j = r.json()
+    text = "".join(c.get("text", "") for o in j["output"] if o["type"] == "message" for c in o["content"])
+    if not text:
+        raise ValueError(f"empty output, status={j.get('status')}, details={j.get('incomplete_details')}")
+    return _extract_json(text), {"model": "muse-spark-1.3", "tokens": j.get("usage", {}).get("total_tokens")}
+
+
+def baseten_json(system: str, user: str, max_tokens: int = 12000) -> tuple[dict, dict]:
+    env = _env()
+    c = OpenAI(api_key=env["BASETEN_API_KEY"], base_url="https://inference.baseten.co/v1")
+    r = c.chat.completions.create(model=env["BASETEN_MODEL"], max_tokens=max_tokens, temperature=0.7,
+                                  messages=[{"role": "system", "content": system},
+                                            {"role": "user", "content": user}])
+    text = r.choices[0].message.content or ""
+    if not text:
+        raise ValueError(f"empty content, finish_reason={r.choices[0].finish_reason}")
+    return _extract_json(text), {"model": env["BASETEN_MODEL"], "tokens": r.usage.total_tokens}
+
+
+def chat_json(system: str, user: str) -> tuple[dict, dict]:
+    try:
+        return spark_json(system, user)
+    except Exception as e:  # fall back so a demo run never dies on one provider
+        out, usage = baseten_json(system, user)
+        usage["fallback_reason"] = f"{type(e).__name__}: {str(e)[:120]}"
+        return out, usage
+
+
+def image_b64(prompt: str) -> bytes:
+    r = requests.post(META + "/images/generations", headers=_hdr(), timeout=180,
+                      json={"model": "muse-image-1.0", "prompt": prompt, "n": 1})
+    r.raise_for_status()
+    return base64.b64decode(r.json()["data"][0]["b64_json"])
+
+
+def transcribe_wav(path: Path) -> dict:
+    req = json.dumps({"mode": "DIARIZATION", "model": "muse-voice-transcribe-1.0", "audioEncoding": "WAV"})
+    with path.open("rb") as f:
+        r = requests.post(META + f"/asr/transcribe?sessionId=adf-{path.stem}-{int(time.time())}",
+                          headers=_hdr(), timeout=180,
+                          files={"request": (None, req, "application/json"), "audio": (path.name, f, "audio/wav")})
+    r.raise_for_status()
+    return r.json()
