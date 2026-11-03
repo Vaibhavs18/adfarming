@@ -15,6 +15,7 @@ def env(tmp_path, monkeypatch):
     (fx / "c_9x16.mp4").write_bytes(MP4_BYTES)
     monkeypatch.setenv("ADFARMING_DB", str(tmp_path / "studio.db"))
     monkeypatch.setenv("ADFARMING_OUT", str(tmp_path / "out"))
+    monkeypatch.setenv("ADF_PRIVATE", str(tmp_path / "private"))  # hermetic: never the real private/
     monkeypatch.setenv("STUDIO_PASSWORD", PASSWORD)
     monkeypatch.setenv("STUDIO_SECRET", "test-secret")
     monkeypatch.setenv("STUDIO_RUNNER", "stub")

@@ -3,7 +3,7 @@ import html
 import json
 from pathlib import Path
 
-from .footage import PRIV
+from . import clients
 
 CSS = """
 :root{--bg:#fbfaf8;--fg:#1b1d21;--mut:#5f6673;--card:#fff;--line:#e6e3dd;--acc:#4f46e5;--ok:#15803d;--bad:#b42318;
@@ -71,11 +71,12 @@ def _secs(ms: int) -> str:
     return f"{s:.0f}s" if s < 90 else f"{s / 60:.1f} min"
 
 
-def render(run_dir: Path, picked: str | None, meta: dict) -> Path:
+def render(run_dir: Path, picked: str | None, meta: dict, client_id: str | None = None) -> Path:
     concepts = json.loads((run_dir / "concepts.json").read_text())
     trace = [json.loads(l) for l in (run_dir / "trace.jsonl").read_text().splitlines() if l.strip()]
-    brief = (PRIV / "brief.md").read_text() if (PRIV / "brief.md").exists() else ""
-    asr = {p.stem: json.loads(p.read_text()) for p in sorted((PRIV / "asr").glob("*.json"))} if (PRIV / "asr").exists() else {}
+    cdir = clients.client_dir(client_id)
+    brief = clients.load_brief(client_id)
+    asr = {p.stem: json.loads(p.read_text()) for p in sorted((cdir / "asr").glob("*.json"))} if (cdir / "asr").exists() else {}
     used = {t["tool"] for t in trace} | ({"muse-voice-transcribe"} if asr else set())
     total_ms, cost = sum(t["duration_ms"] for t in trace), sum(t.get("cost_usd", 0) for t in trace)
     final = next((c for c in concepts if c["id"] == picked), None)

@@ -2,7 +2,8 @@
 
 Env: STUDIO_PASSWORD, STUDIO_SECRET, STUDIO_RUNNER=stub|real, STUDIO_RUN_CAP_USD (1.5),
 STUDIO_DAILY_CAP_USD (15), ADFARMING_DB, ADFARMING_OUT (run output root, default ./out),
-STUDIO_WEB_DIR (default <repo>/web), STUDIO_MEMORY_SEED (optional seed dir for client dharaa),
+STUDIO_WEB_DIR (default <repo>/web), STUDIO_MEMORY_SEED (optional seed dir for the flat default client; per-client seeds live in
+ADF_PRIVATE/clients/<id>/{seed_memory.jsonl,rules.md}),
 STUDIO_HEARTBEAT_S (SSE heartbeat, default 15), STUDIO_COOKIE_SECURE (1/0, default: auto).
 """
 from __future__ import annotations
@@ -28,6 +29,7 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from . import clients as clients_mod
 from . import runner as runner_mod
 from .runner import CostCapExceeded
 from .studio import db, events, gates, memory
@@ -41,7 +43,7 @@ MEDIA_TYPES = {".mp4": "video/mp4", ".webp": "image/webp", ".json": "application
                ".zip": "application/zip", ".png": "image/png", ".jpg": "image/jpeg",
                ".srt": "text/plain; charset=utf-8"}
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PRIVATE_DIR = (REPO_ROOT / "private").resolve()
+PRIVATE_DIR = (REPO_ROOT / "private").resolve()  # the whole tree (incl. clients/<id>/...) is protected
 STEP_NAMES = events.STEPS
 
 
@@ -70,16 +72,41 @@ def set_runner(r: runner_mod.AgentRunner | None) -> None:
     _runner = r
 
 
+def _seed_client(cid: str) -> None:
+    """Seed a client's memory from its seed files, only when it has no memory yet (idempotent;
+    never re-seeds over edits made in the UI)."""
+    if memory.list_memory(cid):
+        return
+    try:
+        items = clients_mod.seed_items(cid)
+    except (clients_mod.ClientDataError, ValueError):
+        return
+    if not items:
+        return
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:  # memory.load_seed reads a JSONL file
+        f = Path(td) / "approved.jsonl"
+        f.write_text("".join(json.dumps(i, ensure_ascii=False) + "\n" for i in items))
+        memory.load_seed(cid, f)
+
+
 def _startup() -> None:
+    cid = os.environ.get("STUDIO_CLIENT_ID") or "dharaa"
+    cname = os.environ.get("STUDIO_CLIENT_NAME") or ("Dharaa by Smriti" if cid == "dharaa" else cid)
+    discovered = clients_mod.list_clients()
     with db.tx() as c:
-        cid = os.environ.get("STUDIO_CLIENT_ID") or "dharaa"
-        cname = os.environ.get("STUDIO_CLIENT_NAME") or ("Dharaa by Smriti" if cid == "dharaa" else cid)
-        db.ensure_client(c, cid, cname)
-        c.execute("UPDATE clients SET name=? WHERE id=?", (cname, cid))
+        if not clients_mod.layout_enabled():
+            db.ensure_client(c, cid, cname)  # single flat client, exactly as before
+            c.execute("UPDATE clients SET name=? WHERE id=?", (cname, cid))
+        for ci in discovered:
+            db.ensure_client(c, ci.id, ci.name)
+            c.execute("UPDATE clients SET name=? WHERE id=?", (ci.name, ci.id))
         rows = c.execute("SELECT id FROM runs").fetchall()
     seed = os.environ.get("STUDIO_MEMORY_SEED")
     if seed and Path(seed).exists() and not memory.list_memory(cid):
         memory.load_seed(cid, seed)  # only a client with no memory yet; never re-seeds over edits
+    for ci in discovered:
+        _seed_client(ci.id)
     for r in rows:
         if runner_mod.get_status(r["id"]) == "running":
             runner_mod.set_status(r["id"], "interrupted")
@@ -244,6 +271,8 @@ def _get_item(cid: str, mid: str) -> dict:
 
 @api.get("/api/clients")
 def clients():
+    if clients_mod.layout_enabled():  # only clients that really have data on disk
+        return [{"id": ci.id, "name": ci.name} for ci in sorted(clients_mod.list_clients(), key=lambda x: x.id)]
     with db.read() as c:
         return [{"id": r["id"], "name": r["name"] or r["id"]}
                 for r in c.execute("SELECT id,name FROM clients ORDER BY id")]
@@ -389,6 +418,8 @@ def _cap_error(e: CostCapExceeded) -> ApiError:
 @api.post("/api/runs", status_code=200)
 def run_create(body: RunCreate, sid: str = Depends(require_auth)):
     _client_or_404(body.client_id)
+    if clients_mod.layout_enabled() and clients_mod.get_client(body.client_id) is None:
+        raise ApiError(404, "client_not_found", f"unknown client {body.client_id!r}")
     try:
         runner_mod.check_caps(None)
     except CostCapExceeded as e:
@@ -602,6 +633,7 @@ def _protected_roots() -> list[tuple[Path, bool]]:
     roots = [(PRIVATE_DIR, False)]
     if os.environ.get("ADF_PRIVATE"):
         roots.append((Path(os.environ["ADF_PRIVATE"]).resolve(), False))
+    roots.append((clients_mod.private_root().resolve(), False))  # covers clients/<id>/** too
     try:
         from .footage import PRIV
         roots.append((Path(PRIV).resolve(), False))

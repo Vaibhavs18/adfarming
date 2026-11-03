@@ -12,6 +12,7 @@ Cards for the human are built HERE from artifacts (docs/API_CONTRACT.md); the mo
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import os
 import re
@@ -126,27 +127,24 @@ def artifact_url(run_id: str, name: str) -> str:
 
 
 # ------------------------------------------------------------------ backends (injectable for tests)
-def _d_load_brief() -> str:
-    from ..footage import PRIV
-    f = PRIV / "brief.md"
-    return f.read_text() if f.exists() else ""
+def _d_load_brief(client_id: str | None = None) -> str:
+    from .. import clients
+    return clients.load_brief(client_id)
 
 
-def _d_load_subject() -> str:
-    from ..footage import PRIV
-    f = PRIV / "subject.txt"
-    return f.read_text().strip() if f.exists() else "an Indian woman in a saree"
+def _d_load_subject(client_id: str | None = None) -> str:
+    from .. import clients
+    return clients.load_subject(client_id)
 
 
-def _d_load_refs() -> str:
-    from ..footage import PRIV
-    f = PRIV / "refs.md"
-    return f.read_text() if f.exists() else ""
+def _d_load_refs(client_id: str | None = None) -> str:
+    from .. import clients
+    return clients.load_refs(client_id)
 
 
-def _d_load_clips():
+def _d_load_clips(client_id: str | None = None):
     from ..footage import load_clips
-    return load_clips()
+    return load_clips(client_id)
 
 
 def _d_generate(*a, **k):
@@ -220,6 +218,18 @@ class Backends:
         if bad:
             raise TypeError(f"unknown backends {sorted(bad)}")
         self._over = overrides
+
+    def for_client(self, name: str, client_id: str):
+        """Call a data loader (load_clips/brief/subject/refs) for this client. Test overrides that
+        take no argument (the legacy single-client shape) are called without it."""
+        fn = getattr(self, name)
+        try:
+            params = inspect.signature(fn).parameters.values()
+            takes = any(p.kind in (p.VAR_POSITIONAL, p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                        or p.kind == p.VAR_KEYWORD for p in params)
+        except (TypeError, ValueError):
+            takes = True
+        return fn(client_id) if takes else fn()
 
     def __getattr__(self, name: str) -> Callable:
         if name.startswith("_"):
@@ -342,7 +352,7 @@ class Toolbox:
 
     def clips(self) -> list[dict]:
         if self._clips is None:
-            self._clips = self.b.load_clips()
+            self._clips = self.b.for_client("load_clips", self.client_id)
         return self._clips
 
     def _ev(self, kind: str, payload: dict, actor: str = "agent", reason: str | None = None) -> int:
@@ -374,7 +384,7 @@ class Toolbox:
 
     def full_brief(self, st: dict | None = None) -> str:
         st = st or self.state()
-        base = (self.b.load_brief() or "").strip()
+        base = (self.b.for_client("load_brief", self.client_id) or "").strip()
         goal = (st.get("brief") or "").strip()
         parts = [base] if base else []
         if goal and goal not in base:
@@ -571,7 +581,7 @@ class Toolbox:
         mem = self._memory_block()
         if mem:
             brief += "\n\nCLIENT MEMORY (approved; hard_rule items are absolute):\n" + mem
-        cs = self.b.generate(self.run, brief, self.clips(), self.b.load_refs(), guidance=guidance)
+        cs = self.b.generate(self.run, brief, self.clips(), self.b.for_client("load_refs", self.client_id), guidance=guidance)
         known = {i["id"] for i in self.approved_memory()}
         cites = [m for m in a.get("memory_ids_used", []) if m in known]
         for c in cs:
@@ -605,7 +615,7 @@ class Toolbox:
         notes = [s["text"] for s in st["steers"] if s["step"] == "preview" and s["text"]]
         if a.get("style_note"):
             notes.append(a["style_note"])
-        subject = self.b.load_subject() + (" Style notes from the human: " + "; ".join(notes) if notes else "")
+        subject = self.b.for_client("load_subject", self.client_id) + (" Style notes from the human: " + "; ".join(notes) if notes else "")
         paths = self.b.frames(self.run, copy.deepcopy(concept), subject)
         names = []
         for i, p in enumerate(paths, 1):
@@ -629,7 +639,7 @@ class Toolbox:
     def _t_build_cuts(self, a: dict, call_id) -> ToolResult:
         st = self.state()
         wc = self.working_concept(st)
-        brief = (self.b.load_brief() or "").strip() or self.full_brief(st)
+        brief = (self.b.for_client("load_brief", self.client_id) or "").strip() or self.full_brief(st)
         hard = self._memory_block(hard_only=True)
         if hard:
             brief += "\n\nCLIENT HARD RULES (QC must verify):\n" + hard
@@ -666,7 +676,7 @@ class Toolbox:
         meta = self._read("meta.json")
         if not meta or not self._art_ok(st, "cuts"):
             raise ToolError("missing_artifact", "no current cut to review", False, "call build_cuts first")
-        brief = (self.b.load_brief() or "").strip() or self.full_brief(st)
+        brief = (self.b.for_client("load_brief", self.client_id) or "").strip() or self.full_brief(st)
         v = self.b.review(self.run, brief, self.working_concept(st), meta["captions"],
                           self.dir / meta["cuts"]["9x16"])
         meta["qc"] = v

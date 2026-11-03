@@ -99,14 +99,18 @@ for `https://SITE_ADDRESS/healthz`, and appends the release tag to `releases.log
 bash deploy/scripts/rotate_judge.sh deploy@$IP     # prints the new password ONCE; copy it into your password manager
 ```
 
-### 11. [HUMAN confirms] Push client data
+### 11. [HUMAN confirms] Push client data (one client at a time)
+Each client lives in `private/clients/<id>/` (`client.json`, `brief.md`, `subject.txt`, `footage/`, `asr/`, optional
+`refs.md`, `rules.md` or `seed_memory.jsonl`). Create one locally with `python scripts/add_client.py --id <id> --name '<Name>' --from <dir>`
+(see docs/CLIENT_SWAP.md), then:
 ```bash
-bash deploy/scripts/push_client_data.sh examples/demo_client deploy@$IP --dry-run   # list only
-bash deploy/scripts/push_client_data.sh examples/demo_client deploy@$IP             # asks you to type "yes"
+bash deploy/scripts/push_client_data.sh <id> deploy@$IP --dry-run   # list only
+bash deploy/scripts/push_client_data.sh <id> deploy@$IP             # asks you to type "yes"
 ```
-Only the directory you name is sent (to `/opt/adfarming/data/private/`), env/key files are refused, nothing on the server
-is deleted. The directory must look like what the pipeline expects: `footage/`, `asr/`, `brief.md`, `subject.txt`.
-Shipping the `asr/` cache saves transcription spend.
+Only `private/clients/<id>/` is sent (to `/opt/adfarming/data/private/clients/<id>/`; the container sees `/data/private/clients/<id>/`),
+env/key files are refused, nothing on the server is deleted. Restart the app afterwards (`docker compose restart app`, or re-run
+`deploy.sh`): at start it discovers every `clients/*/client.json`, lists it in the UI and seeds the client's memory from
+`seed_memory.jsonl`/`rules.md` only if that client has no memory yet. Shipping `asr/` saves transcription spend.
 
 ### 12. Smoke test, go/no-go
 ```bash

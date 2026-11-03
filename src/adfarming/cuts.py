@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .footage import PRIV
+from . import clients
 from .llm import spark_json
 from .trace import Run
 
@@ -38,12 +38,18 @@ def ff(args: list[str]) -> subprocess.CompletedProcess:
 _speech_cache: dict[str, list[tuple[float, float]]] = {}
 
 
+def clip_path(clip: dict) -> Path:
+    """Source file of a clip: the client's own file when load_clips recorded it, else the default
+    client's footage dir (legacy callers that pass bare {file, duration_s} dicts)."""
+    return Path(clip["path"]) if clip.get("path") else clients.footage_dir(None) / clip["file"]
+
+
 def speech_intervals(clip: dict) -> list[tuple[float, float]]:
     """Speech (non-silent) intervals of a clip, from ffmpeg silencedetect."""
-    f = clip["file"]
+    f = str(clip["path"]) if clip.get("path") else clip["file"]  # per-client key: same name, different client
     if f in _speech_cache:
         return _speech_cache[f]
-    p = subprocess.run(["ffmpeg", "-v", "info", "-i", str(PRIV / "footage" / f), "-vn",
+    p = subprocess.run(["ffmpeg", "-v", "info", "-i", str(clip_path(clip)), "-vn",
                         "-af", "silencedetect=noise=-32dB:d=0.12", "-f", "null", "-"],
                        capture_output=True, text=True)
     num = r"(-?[\d.]+(?:e-?\d+)?)"
@@ -254,11 +260,12 @@ def render_title(text: str, ratio: str, path: Path) -> None:
 
 
 # ---------- ffmpeg ----------
-def master(run: Run, concept: dict, work: Path) -> Path:
+def master(run: Run, concept: dict, work: Path, by_file: dict[str, dict] | None = None) -> Path:
+    """by_file: clip name -> clip dict (with its client's 'path'); omitted = default client footage."""
     segs = []
     for i, b in enumerate(concept["beats"], 1):
         t0, seg = time.time(), work / f"seg{i}.mp4"
-        ff(["-ss", f"{b['src_in']:.3f}", "-to", f"{b['src_out']:.3f}", "-i", str(PRIV / "footage" / b["clip"]),
+        ff(["-ss", f"{b['src_in']:.3f}", "-to", f"{b['src_out']:.3f}", "-i", str(clip_path(by_file[b["clip"]]) if by_file and b["clip"] in by_file else clients.footage_dir(None) / b["clip"]),
             "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setsar=1",
             "-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-c:a", "aac", "-ar", "48000", "-ac", "2", str(seg)])
         segs.append(seg)
@@ -311,7 +318,7 @@ def build(run: Run, concept: dict, clips: list[dict], track=None) -> dict:
     trim_dangling(run, concept, by_file)
     chunks = normalise_captions(run, caption_chunks(concept, by_file))
     titles = title_items(concept)
-    m = master(run, concept, work)
+    m = master(run, concept, work, by_file)
     stats = track(m) if track else None
     if stats and stats.get("frames"):
         crop_y = max(0, min(840, int(stats.get("top_q15", stats["top_frac"]) * 1920 - 0.20 * 1080)))

@@ -232,6 +232,19 @@ def _mem_item(i: dict) -> dict:
                               "created_at")} | {"evidence": i.get("evidence") or None}
 
 
+def _client_brief_line(client_id: str) -> str:
+    """First paragraph of the client's own brief (multi-client layout only), so the stub shows
+    which client's data a run is bound to."""
+    from . import clients
+    try:
+        if not clients.layout_enabled():
+            return ""
+        para = clients.load_brief(client_id).strip().split("\n\n")[0].strip()
+    except clients.ClientDataError:
+        return ""
+    return para[:300]
+
+
 class StubRunner(AgentRunner):
     """Scripted session: brief -> ideas -> preview -> edit -> check -> ship."""
 
@@ -252,7 +265,8 @@ class StubRunner(AgentRunner):
         self._tool(run_id, "muse-spark", 0.01, "Drafting a one-paragraph brief.")
         self._request(run_id, "brief", {
             "type": "brief",
-            "text": (goal or "Show the product in use and end with a clear call to action.")
+            "text": (goal or _client_brief_line(client_id)
+                     or "Show the product in use and end with a clear call to action.")
                     + " Keep it warm, honest and under 30 seconds.",
             "memory_cited": [m["id"] for m in mem[:2]],
             "cost_estimate_usd": self.NEXT_COST["brief"]})

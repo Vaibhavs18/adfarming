@@ -12,24 +12,25 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / "src"))
-from adfarming import concepts as C, cuts, qc, sam, storyboard, viewer  # noqa: E402
-from adfarming.footage import PRIV, load_clips  # noqa: E402
+from adfarming import clients, concepts as C, cuts, qc, sam, storyboard, viewer  # noqa: E402
+from adfarming.footage import load_clips  # noqa: E402
 from adfarming.trace import Run  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("run_id")
 ap.add_argument("--pick")
+ap.add_argument("--client", default=None, help="client id (default: STUDIO_CLIENT_ID / flat layout)")
 ap.add_argument("--no-storyboard", action="store_true")
 a = ap.parse_args()
 
 run = Run(a.run_id)
-clips = load_clips()
+clips = load_clips(a.client)
 cfile = run.dir / "concepts.json"
 if cfile.exists():
     print("reusing concepts.json")
 else:
-    refs = (PRIV / "refs.md").read_text() if (PRIV / "refs.md").exists() else ""
-    cs = C.generate(run, (PRIV / "brief.md").read_text(), clips, refs)
+    refs = clients.load_refs(a.client)
+    cs = C.generate(run, clients.load_brief(a.client), clips, refs)
     cfile.write_text(json.dumps(cs, ensure_ascii=False, indent=2))
 cs = json.loads(cfile.read_text())
 meta = {}
@@ -37,10 +38,10 @@ if a.pick:
     concept = next(c for c in cs if c["id"] == a.pick)
     run.trace("human-approval", {"options": [c["id"] for c in cs]}, {"picked": a.pick}, started=time.time(),
               decision=f"human approved concept {a.pick} before any paid generation or cuts")
-    brand = (PRIV / "subject.txt").read_text().strip() if (PRIV / "subject.txt").exists() else "an Indian woman in a saree"
+    brand = clients.load_subject(a.client)
     if not a.no_storyboard:
         meta["frames"] = storyboard.frames(run, concept, brand)
-    brief = (PRIV / "brief.md").read_text()
+    brief = clients.load_brief(a.client)
     history, rounds = [], []   # rounds: per-round snapshot so the BEST round is delivered, not the last
 
     def safe_track(m):
@@ -84,7 +85,7 @@ if a.pick:
     run.trace("deliver-best-round", {"scores": [h["score"] for h in history]}, {"best_round": bi + 1}, status="ok",
               decision=f"delivered round {bi + 1} (score {best['score']}) of {len(rounds)}; best-scoring round, not the last")
     (run.dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
-page = viewer.render(run.dir, a.pick, meta)
+page = viewer.render(run.dir, a.pick, meta, a.client)
 print(f"\nreview page: {page}")
 for c in cs:
     print(f"[{c['id']}] {c['title']} ({c['angle']}, {c['length_s']}s) hook: {c['hook']}")

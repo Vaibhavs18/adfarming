@@ -15,6 +15,7 @@ from adfarming.studio import events, gates, memory
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("ADFARMING_DB", str(tmp_path / "studio.db"))
     monkeypatch.setenv("ADFARMING_OUT", str(tmp_path / "out"))
+    monkeypatch.setenv("ADF_PRIVATE", str(tmp_path / "private"))
     monkeypatch.delenv("STUDIO_RUN_CAP_USD", raising=False)
     monkeypatch.delenv("STUDIO_AGENT", raising=False)
     return tmp_path
