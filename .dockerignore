@@ -12,3 +12,12 @@ __pycache__
 footage
 node_modules
 .DS_Store
+deploy
+docs
+tests
+*.md
+!requirements.txt
+.pytest_cache
+.claude
+data
+*.log

@@ -1,0 +1,77 @@
+# AdFarming Studio on one VM: app (never published) behind Caddy (80/443, HTTPS, basic auth).
+# Always run with:  docker compose --env-file /opt/adfarming/.env -f deploy/docker-compose.yml ...
+# (the scripts in deploy/scripts do this). The env file feeds ${...} interpolation below AND the
+# app container (env_file). Caddy only receives the three Caddy variables, never the API keys.
+name: adfarming
+
+services:
+  app:
+    image: adfarming:${TAG:-latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      platforms: ["linux/amd64"]
+    init: true
+    restart: unless-stopped
+    env_file:
+      - /opt/adfarming/.env
+    environment:
+      # Paths inside the container; also baked into the image, repeated so config shows them.
+      ADF_PRIVATE: /data/private
+      ADF_OUT: /data/out
+      ADFARMING_OUT: /data/out
+      ADFARMING_DB: /data/db/studio.db
+      HOME: /tmp
+    expose:
+      - "8000"          # internal only. There is deliberately NO "ports:" here.
+    volumes:
+      # Client data. Default rw because the pipeline caches asr/ and audio/ next to the footage.
+      # Set PRIVATE_MODE=ro in /opt/adfarming/.env once asr/ and audio/ are pushed and no new footage is transcribed.
+      - /opt/adfarming/data/private:/data/private:${PRIVATE_MODE:-rw}
+      - /opt/adfarming/data/out:/data/out
+      - /opt/adfarming/data/db:/data/db
+    tmpfs:
+      - /tmp:size=512m
+    mem_limit: 3g
+    memswap_limit: 3g
+    cpus: 2.0
+    pids_limit: 512
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in /opt/adfarming/.env}
+      CADDY_BASIC_AUTH_USER: ${CADDY_BASIC_AUTH_USER:-judge}
+      CADDY_BASIC_AUTH_HASH: ${CADDY_BASIC_AUTH_HASH:?set CADDY_BASIC_AUTH_HASH in /opt/adfarming/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # certificates: keep, or Let's Encrypt rate limits bite on redeploy
+      - caddy_config:/config
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,72 @@
+# Caddy v2 (pinned 2.10 in docker-compose.yml). Env: SITE_ADDRESS, CADDY_BASIC_AUTH_USER, CADDY_BASIC_AUTH_HASH.
+{
+	# HTTP/1.1 and HTTP/2 only: no UDP/443 needed, so the firewall stays 22/80/443 tcp.
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_header 30s
+			read_body   5m
+			idle        5m
+		}
+	}
+}
+
+(proxy_app) {
+	encode zstd gzip   # not applied to the SSE route below, so event frames are never buffered
+	reverse_proxy app:8000 {
+		transport http {
+			dial_timeout            5s
+			response_header_timeout 5m   # slow Meta API calls (up to 5 min) before first byte
+		}
+		header_down -Server
+	}
+}
+
+{$SITE_ADDRESS} {
+	# Uploads: footage over HTTP is capped; use push_client_data.sh (rsync) for big files.
+	request_body {
+		max_size 200MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	# Open: liveness only, never reaches a paid API.
+	handle /healthz {
+		import proxy_app
+	}
+
+	# Dotfiles and data directories are never served, with or without credentials.
+	@hidden path /.* /private /private/* /out /out/*
+	handle @hidden {
+		respond 404
+	}
+
+	handle {
+		basic_auth {
+			{$CADDY_BASIC_AUTH_USER} {$CADDY_BASIC_AUTH_HASH}
+		}
+
+		# Server-sent events: never buffer, no response timeout on the open stream.
+		@sse path /api/runs/*/events
+		handle @sse {
+			reverse_proxy app:8000 {
+				flush_interval -1
+				transport http {
+					dial_timeout 5s
+				}
+				header_down -Server
+			}
+		}
+
+		handle {
+			import proxy_app
+		}
+	}
+}
