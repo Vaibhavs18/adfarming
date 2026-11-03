@@ -282,14 +282,14 @@ function CutTabs({ cuts }) {
 function EditCard({ card, run, act, busy }) {
   const [hook, setHook] = useState(card.hook);
   const [cta, setCta] = useState(card.cta);
-  const [caps, setCaps] = useState(card.captions.map((c) => c.text));
-  useEffect(() => { setHook(card.hook); setCta(card.cta); setCaps(card.captions.map((c) => c.text)); }, [card.hook, card.cta, card.captions.map((c) => c.text).join('\u0001')]);
-  const dirty = hook !== card.hook || cta !== card.cta || caps.some((t, i) => t !== card.captions[i].text);
-  const banned = /\b(sale|hurry|only today|limited time|last chance)\b/i.exec(hook + ' ' + caps.join(' '));
-  const save = () => act({ action: 'edit', fields: { hook, cta, captions: card.captions.map((c, i) => ({ ...c, text: caps[i] })) } });
+  useEffect(() => { setHook(card.hook); setCta(card.cta); }, [card.hook, card.cta]);
+  const dirty = hook !== card.hook || cta !== card.cta;
+  const banned = /\b(sale|hurry|only today|limited time|last chance)\b/i.exec(hook + ' ' + card.captions.map((c) => c.text).join(' '));
+  // Caption text is generated from speech and cannot be overridden by the backend: only hook/cta edits are sent.
+  const save = () => act({ action: 'edit', fields: { hook, cta } });
   const cuts = run.artifacts && run.artifacts.cuts;
   return html`<article class="card"><h2><span class="step">4</span>Edit the cut</h2>
-    <p class="lead">Fix words by hand, or steer one caption. Your edits are final: I will not overwrite them.</p>
+    <p class="lead">Edit the hook or call to action by hand; your edits are final. Caption words come from the speech, so to change one, use Steer instead of typing over it.</p>
     ${cuts && html`<${CutTabs} cuts=${cuts} />`}
     <div class="field-row"><div><label class="f" for="eh">Hook</label><input id="eh" type="text" value=${hook} onInput=${(e) => setHook(e.target.value)} /></div>
     <div><label class="f" for="ec">Call to action</label><input id="ec" type="text" value=${cta} onInput=${(e) => setCta(e.target.value)} /></div></div>
@@ -297,7 +297,7 @@ function EditCard({ card, run, act, busy }) {
     <h4 style="margin-top:16px">Captions</h4>
     <div class="scroll"><table class="caps"><thead><tr><th>#</th><th>Time</th><th>Text</th><th></th></tr></thead><tbody>
       ${card.captions.map((c, i) => html`<tr key=${i}><td class="n">${i + 1}</td><td class="t" style="white-space:nowrap">${c.start.toFixed(1)}–${c.end.toFixed(1)}s</td>
-        <td class="x"><input type="text" aria-label=${'Caption ' + (i + 1) + ' text'} value=${caps[i]} onInput=${(e) => setCaps(caps.map((t, j) => (j === i ? e.target.value : t)))} /></td>
+        <td class="x">${c.text}</td>
         <td class="s"><button class="btn sm ghost" onClick=${() => { window.dispatchEvent(new CustomEvent('prefill-steer', { detail: `Caption ${i + 1}: ` })); }}>Steer</button></td></tr>`)}
     </tbody></table></div>
     <h4 style="margin-top:16px">Clips</h4>
@@ -359,14 +359,15 @@ function ShipCard({ card, run, act, busy, cid, memChanged, toast }) {
     <//></article>`;
 }
 
-function WorkingCard({ run, latest }) {
+function WorkingCard({ run, latest, onResume }) {
   const label = STATUS[run.status] ? STATUS[run.status][0] : run.status;
-  const hint = { interrupted: 'The server restarted while this run was working. Start a new run to continue.', error: 'Something went wrong in this run. Check the decision log for details.', cancelled: 'You stopped this run.', done: 'This run is finished.' }[run.status];
+  const hint = { interrupted: 'The server restarted while this run was working. Nothing you approved is lost: resume to continue.', error: 'Something went wrong in this run. Check the decision log, then resume to try again.', cancelled: 'You stopped this run.', done: 'This run is finished.' }[run.status];
   const busy = run.status === 'running';
   return html`<article class="card working" aria-live="polite">
     ${busy ? html`<div class="spinner" aria-hidden="true"></div>` : null}
     <h2>${busy ? `Working on ${STEP_LABELS[run.current_step]}` : label}</h2>
     <p class="mut">${hint || (latest ? latest.text : 'Getting started.')}</p>
+    ${(run.status === 'interrupted' || run.status === 'error') && onResume && html`<div class="actions"><button class="btn primary" onClick=${onResume}>Resume</button></div>`}
     ${busy && html`<p class="mut sm">Nothing to do right now. This screen updates itself when it needs you.</p>`}</article>`;
 }
 
@@ -377,7 +378,7 @@ function GateCard(props) {
     const card = { type: 'ship', cuts: run.artifacts.cuts, zip: run.artifacts.zip, memory_proposals: props.memory.filter((m) => m.status === 'proposed') };
     return html`<${ShipCard} ...${props} card=${card} />`;
   }
-  if (!g) return html`<${WorkingCard} run=${run} latest=${props.latest} />`;
+  if (!g) return html`<${WorkingCard} run=${run} latest=${props.latest} onResume=${props.onResume} />`;
   const card = g.card;
   const C = { brief: BriefCard, ideas: IdeasCard, preview: PreviewCard, edit: EditCard, check: CheckCard, ship: ShipCard }[card.type];
   if (!C) return html`<article class="card"><p>Unknown card type: ${card.type}</p></article>`;
@@ -517,7 +518,7 @@ function Studio({ runId, cid, memory, memChanged, toast, openLog, memOpen }) {
     <div class="studio">
       <aside class=${'col-mem ' + (memOpen ? 'open' : '')}><${MemoryPanel} cid=${cid} items=${memory} inPlayIds=${inPlayIds} onChange=${memChanged} toast=${toast} /></aside>
       <main style="min-width:0"><${MemoryStrip} items=${run.memory_in_play} /><${Stepper} steps=${run.steps} />
-        <${GateCard} memory=${memory} run=${run} act=${act} busy=${busy} memById=${memById} cid=${cid} memChanged=${memChanged} toast=${toast} latest=${comm[comm.length - 1]} /></main>
+        <${GateCard} memory=${memory} run=${run} act=${act} busy=${busy} memById=${memById} cid=${cid} memChanged=${memChanged} toast=${toast} latest=${comm[comm.length - 1]} onResume=${async () => { try { await api(`/api/runs/${runId}/resume`, { method: 'POST' }); await refetch(); } catch (e) { toast(e.message); await refetch(); } }} /></main>
       <div class="col-side"><${SteerBox} run=${run} act=${act} busy=${busy} /><div style="height:16px"></div><${Commentary} items=${comm} /></div>
     </div></div>`;
 }

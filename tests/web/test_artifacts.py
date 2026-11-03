@@ -82,3 +82,23 @@ def test_private_dir_never_served(client, env, monkeypatch):
     # even if ADFARMING_OUT pointed inside private/, the file must not be served
     monkeypatch.setenv("ADFARMING_OUT", str(web.PRIVATE_DIR / "nope"))
     assert client.get(f"/api/runs/{rid}/artifacts/c_9x16.mp4").status_code == 404
+
+
+def test_adf_private_and_db_dir_never_served(client, env, monkeypatch):
+    import os
+    from .helpers import new_run
+    priv = env / "adfpriv"
+    priv.mkdir()
+    (priv / "secret.json").write_text('{"x":1}')
+    monkeypatch.setenv("ADF_PRIVATE", str(priv))
+    rid = new_run(client)
+    d = env / "out" / rid
+    d.mkdir(parents=True, exist_ok=True)
+    os.symlink(priv / "secret.json", d / "leak.json")
+    assert client.get(f"/api/runs/{rid}/artifacts/leak.json").status_code == 404
+    # symlink to the DB file (lives next to out/ in tests) is refused too
+    os.symlink(env / "studio.db", d / "db.json")
+    assert client.get(f"/api/runs/{rid}/artifacts/db.json").status_code == 404
+    # a normal artifact still works, even though out/ sits inside the DB directory here
+    (d / "ok.json").write_text("{}")
+    assert client.get(f"/api/runs/{rid}/artifacts/ok.json").status_code == 200

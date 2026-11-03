@@ -12,14 +12,19 @@ uses exactly the same status/cost bookkeeping as the stub.
 from __future__ import annotations
 
 import io
+import logging
 import os
 import shutil
+import threading
+import time
 import zipfile
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .studio import db, events, gates, memory
 
+log = logging.getLogger("adfarming.runner")
 TERMINAL = ("done", "error", "cancelled")
 
 
@@ -101,14 +106,124 @@ class AgentRunner(ABC):
     @abstractmethod
     def cancel(self, run_id: str) -> None: ...
 
+    def recover(self, run_id: str) -> None:
+        """Restart a run left 'interrupted'/'error'. A pending gate just goes back to awaiting_human."""
+        if events.rebuild_run_state(run_id)["pending_gate"]:
+            set_status(run_id, "awaiting_human")
+        else:
+            self.resume(run_id)
+
 
 class RealRunner(AgentRunner):
-    def __init__(self) -> None:
-        raise NotImplementedError("the real agent loop is built by a later task")
+    """Runs the real agent loop (`adfarming.agent.AgentLoop`) in a small thread pool.
 
-    def start(self, run_id, client_id, goal): raise NotImplementedError
-    def resume(self, run_id): raise NotImplementedError
-    def cancel(self, run_id): raise NotImplementedError
+    start/resume return right away; the loop does one advance (up to the next gate or the end) in the
+    background and the status events (awaiting_human / done / error) are what the SSE stream and the UI
+    read. One advance per run at a time (lock); the web layer enforces one running run globally.
+    """
+
+    SAFE_ERROR = "The agent hit an unexpected problem and stopped. Your approvals are saved; use Resume to try again."
+
+    def __init__(self, loop=None, workers: int = 2) -> None:
+        self._loop = loop
+        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="adf-agent")
+        self._guard = threading.Lock()
+        self._busy: set[str] = set()
+        self._cancelled: set[str] = set()
+
+    def _agent(self):
+        if self._loop is None:
+            from .agent import AgentLoop
+            self._loop = AgentLoop()
+        return self._loop
+
+    # -- interface
+    def start(self, run_id: str, client_id: str, goal: str | None) -> None:
+        run_dir(run_id).mkdir(parents=True, exist_ok=True)
+        self._submit(run_id)
+
+    def resume(self, run_id: str) -> None:
+        self._submit(run_id)
+
+    def recover(self, run_id: str) -> None:
+        self._submit(run_id)  # the loop itself returns awaiting_human when a gate is pending
+
+    def cancel(self, run_id: str) -> None:
+        with self._guard:
+            self._cancelled.add(run_id)
+        events.append_event(run_id, "commentary", "system", {"text": "Run cancelled."})
+
+    def wait_idle(self, timeout: float = 30.0) -> bool:
+        """Test helper: block until no advance is in flight."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with self._guard:
+                if not self._busy:
+                    return True
+            time.sleep(0.01)
+        return False
+
+    # -- internals
+    def _submit(self, run_id: str) -> None:
+        with self._guard:
+            if run_id in self._busy:
+                return  # one advance per run; the in-flight one will pick up the newest log state
+            self._cancelled.discard(run_id)
+            self._busy.add(run_id)
+        set_status(run_id, "running")
+        try:
+            self._pool.submit(self._work, run_id)
+        except Exception:
+            with self._guard:
+                self._busy.discard(run_id)
+            raise
+
+    def _is_cancelled(self, run_id: str) -> bool:
+        with self._guard:
+            return run_id in self._cancelled
+
+    def _work(self, run_id: str) -> None:
+        try:
+            if self._is_cancelled(run_id):
+                return
+            check_caps(run_id)
+            res = self._agent().advance(run_id)
+            if self._is_cancelled(run_id):
+                if get_status(run_id) != "cancelled":
+                    set_status(run_id, "cancelled")
+                return
+            status = (res or {}).get("status")
+            if status in ("awaiting_human", "done", "error"):
+                if get_status(run_id) != status:
+                    set_status(run_id, status)
+            elif status == "running":
+                pass  # another advance holds the loop lock; it reports its own status
+            else:
+                self._fail(run_id, self.SAFE_ERROR)
+        except CostCapExceeded as e:
+            self._fail(run_id, f"Spending cap reached: {e}. Nothing more was spent.")
+        except Exception as e:  # never leak a stack trace or key to the client
+            log.error("agent advance failed for run %s: %s: %s", run_id, type(e).__name__, _redact(str(e)))
+            self._fail(run_id, self.SAFE_ERROR)
+        finally:
+            with self._guard:
+                self._busy.discard(run_id)
+
+    @staticmethod
+    def _fail(run_id: str, msg: str) -> None:
+        try:
+            events.append_event(run_id, "error", "system", {"message": msg})
+            set_status(run_id, "error")
+        except Exception:
+            log.exception("could not record failure for run %s", run_id)
+
+
+def _redact(text: str) -> str:
+    out = text[:300]
+    for k, v in os.environ.items():
+        if v and len(v) >= 8 and any(w in k.upper() for w in ("KEY", "SECRET", "PASSWORD", "TOKEN")):
+            out = out.replace(v, "***")
+    return out
 
 
 # ---------------------------------------------------------------- stub
@@ -332,5 +447,7 @@ def make_runner() -> AgentRunner:
     if kind == "stub":
         return StubRunner()
     if kind == "real":
+        if (os.environ.get("STUDIO_AGENT") or "auto").lower() in ("auto", ""):
+            os.environ["STUDIO_AGENT"] = "wonder"  # auto = Wonder with per-turn scripted fallback
         return RealRunner()
     raise ValueError(f"STUDIO_RUNNER must be stub|real, got {kind!r}")

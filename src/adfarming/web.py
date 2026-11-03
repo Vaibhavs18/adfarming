@@ -72,11 +72,14 @@ def set_runner(r: runner_mod.AgentRunner | None) -> None:
 
 def _startup() -> None:
     with db.tx() as c:
-        db.ensure_client(c, "dharaa", "Dharaa by Smriti")
+        cid = os.environ.get("STUDIO_CLIENT_ID") or "dharaa"
+        cname = os.environ.get("STUDIO_CLIENT_NAME") or ("Dharaa by Smriti" if cid == "dharaa" else cid)
+        db.ensure_client(c, cid, cname)
+        c.execute("UPDATE clients SET name=? WHERE id=?", (cname, cid))
         rows = c.execute("SELECT id FROM runs").fetchall()
     seed = os.environ.get("STUDIO_MEMORY_SEED")
-    if seed and Path(seed).exists():
-        memory.load_seed("dharaa", seed)
+    if seed and Path(seed).exists() and not memory.list_memory(cid):
+        memory.load_seed(cid, seed)  # only a client with no memory yet; never re-seeds over edits
     for r in rows:
         if runner_mod.get_status(r["id"]) == "running":
             runner_mod.set_status(r["id"], "interrupted")
@@ -336,9 +339,9 @@ def _state(run: dict) -> dict:
         gate = {"id": pg["gate_id"], "step": pg["step"], "card": (pg.get("payload") or {}).get("card")}
     ideas, prev, edit, chk, ship = (_card_of(evs, s) for s in ("ideas", "preview", "edit", "check", "ship"))
     arts = {
-        "concepts": ideas["concepts"] if ideas else None,
+        "concepts": ideas.get("concepts") if ideas else None,
         "frames": (prev or {}).get("frames", []),
-        "cuts": (ship or {}).get("cuts") if ship else _cuts_if_present(rid, edit),
+        "cuts": (ship or {}).get("cuts") if ship else ((edit or {}).get("cuts") or _cuts_if_present(rid, edit)),
         "captions": (edit or {}).get("captions", []),
         "qc": ({**chk["verdict"]} if chk else None),
         "zip": (ship or {}).get("zip"),
@@ -408,7 +411,7 @@ def run_create(body: RunCreate, sid: str = Depends(require_auth)):
         _fail(run_id, str(e))
         raise _cap_error(e)
     except Exception as e:  # runner crash must not leave the run 'running'
-        _fail(run_id, f"{type(e).__name__}: {e}")
+        _fail(run_id, runner_mod.RealRunner.SAFE_ERROR)
     return {"run_id": run_id}
 
 
@@ -449,6 +452,7 @@ def run_answer(run_id: str, body: AnswerBody):
         runner_mod.check_caps(run_id)
     except CostCapExceeded as e:
         raise _cap_error(e)
+    _assert_not_busy(run_id)
     payload: dict[str, Any] = {}
     if body.choice is not None:
         payload["choice"] = body.choice
@@ -481,7 +485,35 @@ def run_answer(run_id: str, body: AnswerBody):
         _fail(run_id, str(e))
         raise ApiError(409, "gate_blocked", str(e))
     except Exception as e:
-        _fail(run_id, f"{type(e).__name__}: {e}")
+        _fail(run_id, runner_mod.RealRunner.SAFE_ERROR)
+    return {"status": "accepted"}
+
+
+def _assert_not_busy(run_id: str) -> None:
+    with db.read() as c:
+        others = [r["id"] for r in c.execute("SELECT id FROM runs WHERE id<>?", (run_id,))]
+    if any(runner_mod.get_status(r) == "running" for r in others):
+        raise ApiError(409, "busy", "another run is currently working; wait for it to pause or finish")
+
+
+@api.post("/api/runs/{run_id}/resume", status_code=202)
+def run_resume(run_id: str):
+    """Restart a run left 'interrupted' (server restart) or 'error'. Nothing already approved is redone."""
+    _valid_run(run_id)
+    if runner_mod.get_status(run_id) not in ("interrupted", "error"):
+        raise ApiError(409, "not_resumable", "only an interrupted or failed run can be resumed")
+    try:
+        runner_mod.check_caps(run_id)
+    except CostCapExceeded as e:
+        raise _cap_error(e)
+    _assert_not_busy(run_id)
+    try:
+        get_runner().recover(run_id)
+    except CostCapExceeded as e:
+        _fail(run_id, str(e))
+        raise _cap_error(e)
+    except Exception as e:
+        _fail(run_id, runner_mod.RealRunner.SAFE_ERROR)
     return {"status": "accepted"}
 
 
@@ -565,6 +597,30 @@ def run_log(run_id: str):
 
 
 # ------------------------------------------------------------------ artifacts
+def _protected_roots() -> list[tuple[Path, bool]]:
+    """(root, out_root_may_live_inside). Client data and the DB directory are never served."""
+    roots = [(PRIVATE_DIR, False)]
+    if os.environ.get("ADF_PRIVATE"):
+        roots.append((Path(os.environ["ADF_PRIVATE"]).resolve(), False))
+    try:
+        from .footage import PRIV
+        roots.append((Path(PRIV).resolve(), False))
+    except Exception:
+        pass
+    if os.environ.get("ADFARMING_DB"):
+        roots.append((Path(os.environ["ADFARMING_DB"]).resolve().parent, True))
+    return roots
+
+
+def _is_protected(rp: Path) -> bool:
+    out = runner_mod.out_root().resolve()
+    in_out = out == rp or out in rp.parents
+    for r, out_ok in _protected_roots():
+        if (rp == r or r in rp.parents) and not (out_ok and in_out):
+            return True
+    return False
+
+
 def safe_artifact_path(run_id: str, name: str) -> Path:
     """Flat filename that exists directly in the run's output dir. Raises ApiError(404)."""
     nf = ApiError(404, "not_found", "no such artifact")
@@ -579,7 +635,7 @@ def safe_artifact_path(run_id: str, name: str) -> Path:
         rp = p.resolve(strict=True)
     except (FileNotFoundError, OSError):
         raise nf
-    if rp.parent != base or not rp.is_file() or rp == PRIVATE_DIR or PRIVATE_DIR in rp.parents:
+    if rp.parent != base or not rp.is_file() or _is_protected(rp):
         raise nf
     return rp
 
