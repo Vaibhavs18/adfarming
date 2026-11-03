@@ -66,8 +66,12 @@ def validate(concepts: list[dict], clips: list[dict]) -> None:
                 raise ValueError(f"{c['id']}: beats overlap inside {c1} ({a1}-{z1} vs {a2}-{z2}); use non-overlapping ranges")
 
 
-def generate(run: Run, brief: str, clips: list[dict], refs: str, attempts: int = 3) -> list[dict]:
-    prompt = PROMPT.format(brief=brief, clips=clips_block(clips), refs=refs or "(none provided yet)")
+def _guided(prompt: str, guidance: str) -> str:
+    return prompt + (f"\n\nHUMAN GUIDANCE (obey it):\n{guidance.strip()}" if guidance and guidance.strip() else "")
+
+
+def generate(run: Run, brief: str, clips: list[dict], refs: str, attempts: int = 3, guidance: str = "") -> list[dict]:
+    prompt = _guided(PROMPT.format(brief=brief, clips=clips_block(clips), refs=refs or "(none provided yet)"), guidance)
     last = None
     for i in range(attempts):
         t0 = time.time()
@@ -110,9 +114,9 @@ never end on an unfinished sentence or a stutter (the clip's final words may be 
 the cta is shown as a soft end card. Keep length 12-25s."""
 
 
-def revise(run: Run, brief: str, concept: dict, verdict: dict, clips: list[dict]) -> dict:
-    prompt = REVISE.format(brief=brief, concept=concept, issues="\n".join(verdict.get("issues", [])),
-                           fixes="\n".join(verdict.get("fixes", [])), clips=clips_block(clips))
+def revise(run: Run, brief: str, concept: dict, verdict: dict, clips: list[dict], guidance: str = "") -> dict:
+    prompt = _guided(REVISE.format(brief=brief, concept=concept, issues="\n".join(verdict.get("issues", [])),
+                                   fixes="\n".join(verdict.get("fixes", [])), clips=clips_block(clips)), guidance)
     last = None
     for i in range(3):
         t0 = time.time()
