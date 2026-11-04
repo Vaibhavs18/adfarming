@@ -46,7 +46,7 @@ def test_default_plan_validates_and_lints_clean():
     assert codes(p) == set()
     assert p["duration"] == 11.0 and p["meta"]["source"] == "default"
     roles = {t["role"]: t for t in p["text"]}
-    assert roles["hook"]["text"] == "Worried about fit?" and roles["cta"]["text"] == CONCEPT["cta"]
+    assert roles["hook"]["text"] == "Worried about fit?" and roles["cta"]["text"] == "Shop Kurta"
     assert roles["cta"]["end"] <= 11.0 and roles["cta"]["start"] >= 8.0
 
 
@@ -69,7 +69,7 @@ def test_lint_catches_each_rule():
     # timing outside the reel
     assert "timing" in codes(mod(lambda p: p["text"][0].update(end=30.0)))
     # locked text altered
-    assert "locked" in codes(mod(lambda p: [t.update(text="Buy now cheaper") for t in p["text"] if t["role"] == "cta"]))
+    assert "cta_short" in codes(mod(lambda p: [t.update(text="See the kurta on our website today") for t in p["text"] if t["role"] == "cta"]))
     assert "locked" in codes(mod(lambda p: [t.update(text="Other hook") for t in p["text"] if t["role"] == "hook"]))
     # too long for region
     assert "text_len" in codes(mod(lambda p: p["text"].append(
@@ -130,7 +130,7 @@ def test_repair_fixes_timings_text_and_backdrops():
                           text="this callout is much too long for a small side region", start=4.5, end=7.0, beat=1,
                           plate="#fbbf24", fill="#111111"))
     p["captions"]["scrim"] = 0.0
-    p["text"][1].update(text="Tampered cta")
+    p["text"][1].update(text="Tampered cta - soft end card")
     fixed = cp.repair_plan(p, cp.lint_plan(p, CONCEPT, RULES, assets_info=ASSETS), CONCEPT, assets_info=ASSETS)
     assert codes(fixed) == set()
     assert not list(VAL.iter_errors(fixed))
@@ -139,7 +139,7 @@ def test_repair_fixes_timings_text_and_backdrops():
     assert fixed["background"][0]["src"] == "wall.png"  # people still swapped for the person-free one
     callout = next(t for t in fixed["text"] if t["role"] == "callout")
     assert len(callout["text"]) <= cp.REGION_CAP["left_mid"]
-    assert next(t for t in fixed["text"] if t["role"] == "cta")["text"] == CONCEPT["cta"]
+    assert next(t for t in fixed["text"] if t["role"] == "cta")["text"] == "Shop Kurta"
     assert fixed["captions"]["scrim"] >= 0.35
     assert fixed["meta"]["repaired"]
 
@@ -173,11 +173,11 @@ def test_price_allowed_when_concept_gave_it():
 
 def test_locked_cta_overlong_keeps_text_and_fits_by_size():
     c = copy.deepcopy(CONCEPT)
-    c["cta"] = "If you are new to sarees and kurtas, do come and see the whole collection on our website today"
+    c["cta_short"] = "If you are new to sarees and kurtas, do come and see everything we have here"
     p = cp.default_plan(c, None)
     p = cp.repair_plan(p, [], c)
     cta = next(t for t in p["text"] if t["role"] == "cta")
-    assert cta["text"] == c["cta"] and cta["size"] < 64
+    assert cta["text"] == c["cta_short"] and cta["size"] < 64
 
 
 def test_backdrop_requests_are_person_free_and_tinted():
@@ -256,7 +256,7 @@ def test_falls_back_to_default_after_retries():
     assert len(fake.prompts) == 3  # 1 + 2 retries
     assert p["meta"]["source"] == "default"
     assert not list(VAL.iter_errors(p)) and codes(p) == set()
-    assert next(t for t in p["text"] if t["role"] == "cta")["text"] == CONCEPT["cta"]
+    assert next(t for t in p["text"] if t["role"] == "cta")["text"] == "Shop Kurta"
 
 
 def test_model_cannot_overwrite_human_locked_text():
@@ -265,7 +265,13 @@ def test_model_cannot_overwrite_human_locked_text():
         t["text"] = "Model rewrite"
     p = run_plan(Fake([p0]))
     texts = {t["role"]: t["text"] for t in p["text"]}
-    assert texts["cta"] == CONCEPT["cta"] and texts["hook"] == "Worried about fit?"
+    assert texts["hook"] == "Worried about fit?" and cp.cta_issue(texts["cta"]) is None
+    p1 = run_plan(Fake([p0]), brand_colours=None)
+    assert p1["meta"]["source"] == "spark"
+    c2 = dict(CONCEPT, cta_short="Shop Kurta now")  # a human-edited short CTA always wins over the model
+    p0["text"][1]["text"] = "Something else"
+    q = cp.repair_plan(p0, [], c2, assets_info=ASSETS)
+    assert next(t for t in q["text"] if t["role"] == "cta")["text"] == "Shop Kurta now"
 
 
 def test_look_preset_requested_is_enforced_or_defaulted():
@@ -273,3 +279,200 @@ def test_look_preset_requested_is_enforced_or_defaulted():
     p = run_plan(fake, look="cutout_on_textile_plate")
     assert len(fake.prompts) == 3 and p["meta"]["source"] == "default"
     assert p["preset"] == "cutout_on_textile_plate"
+
+
+# ----------------------------------------------------------------- composed-look fixes (F2)
+INTERNAL_CONCEPT = dict(CONCEPT, cta="If you're new to sarees, see this Maheshwari on our website - soft end card")
+HEAD = {"top_frac": 0.29, "bbox_frac": [0.2, 0.15, 0.8, 1.0]}
+
+
+def test_cta_short_never_carries_internal_direction():
+    assert cp.cta_issue("See this Maheshwari on our website - soft end card")
+    assert cp.cta_issue("Shop Maheshwari now please sir") and cp.cta_issue("soft end card") and cp.cta_issue("")
+    assert cp.cta_issue("Shop Maheshwari") is None
+    assert cp.derive_cta_short(INTERNAL_CONCEPT) == "Shop Maheshwari"
+    p = cp.default_plan(INTERNAL_CONCEPT, None)
+    cta = next(t for t in p["text"] if t["role"] == "cta")
+    assert cta["text"] == "Shop Maheshwari" == cta["cta_short"]
+    assert not any("soft" in t["text"] or " - " in t["text"] for t in p["text"])
+    assert not list(VAL.iter_errors(p))
+    # a model that echoes the direction is repaired to the short CTA, no retry needed
+    bad = copy.deepcopy(p)
+    next(t for t in bad["text"] if t["role"] == "cta").update(text=INTERNAL_CONCEPT["cta"], cta_short=INTERNAL_CONCEPT["cta"][:40])
+    probs = cp.lint_plan(bad, INTERNAL_CONCEPT, RULES)
+    assert any(x["code"] in ("cta_short", "schema") for x in probs)
+    fixed = cp.repair_plan(bad, [], INTERNAL_CONCEPT)
+    assert next(t for t in fixed["text"] if t["role"] == "cta")["text"] == "Shop Maheshwari"
+    assert not [x for x in cp.lint_plan(fixed, INTERNAL_CONCEPT, RULES) if x["level"] == "error"]
+
+
+def test_human_cta_short_wins_and_prompt_hides_internal_direction():
+    c = dict(INTERNAL_CONCEPT, cta_short="Shop the saree")
+    p = cp.repair_plan(cp.default_plan(c, None), [], c)
+    assert next(t for t in p["text"] if t["role"] == "cta")["text"] == "Shop the saree"
+    p["text"][-1]["text"] = p["text"][-1]["cta_short"] = "Something else"
+    assert "locked" in {x["code"] for x in cp.lint_plan(p, c, RULES)}
+    prompt = cp._build_prompt(c, "b", "", ASSETS, "", None, [])
+    assert "Shop the saree" in prompt and "soft end card" not in prompt
+    free = cp._build_prompt(INTERNAL_CONCEPT, "b", "", ASSETS, "", None, [])
+    assert "NEVER show it" in free and "Shop Maheshwari" in free
+
+
+def test_text_capped_at_80_chars():
+    c = copy.deepcopy(CONCEPT)
+    c["beats"][0]["on_screen_text"] = "word " * 30
+    assert len(cp._hook_text(c)) <= cp.MAX_TEXT_CHARS
+    p = cp.default_plan(c, None)
+    assert not list(VAL.iter_errors(p))
+    q = good()
+    q["text"][0]["text"] = "x" * 100
+    assert len(cp.repair_plan(q, [], CONCEPT)["text"][0]["text"]) <= cp.MAX_TEXT_CHARS
+    assert len(cp.clip_text("a" * 200)) <= cp.MAX_TEXT_CHARS
+
+
+def test_headline_stays_above_head_top():
+    c = copy.deepcopy(CONCEPT)
+    c["beats"][0]["on_screen_text"] = "Maheshwari saree that feels comfortable to wear"
+    p = cp.default_plan(c, None, head=HEAD)
+    hook = next(t for t in p["text"] if t["role"] == "hook")
+    top_px = int(HEAD["top_frac"] * 1920)
+    assert cp.HEADLINE_TOP_PX + cp.headline_height_px(hook["text"], hook["size"], 8) <= top_px - cp.HEADLINE_GAP_PX
+    assert hook["size"] < 96 and hook["stroke"][0] == 8 and hook["weight"] == "black"
+    assert hook["keyword"] and hook["keyword"].lower() in hook["text"].lower()
+    # an oversized headline from the model is flagged then fixed
+    big = copy.deepcopy(p)
+    big["text"][0]["size"] = 150
+    assert "headline_room" in {x["code"] for x in cp.lint_plan(big, c, RULES)}
+    assert not [x for x in cp.lint_plan(cp.repair_plan(big, [], c), c, RULES) if x["code"] == "headline_room" and x["level"] == "error"]
+    # without a head box nothing is touched
+    q = cp.repair_plan(good(), [], CONCEPT)
+    assert next(t for t in q["text"] if t["role"] == "hook")["size"] == 96
+
+
+def test_callout_goes_to_side_margin_away_from_head():
+    p = good()
+    p["meta"]["head"] = {"top_frac": 0.29, "bbox_frac": [0.05, 0.15, 0.65, 1.0]}  # speaker off to the left
+    p["text"].append(dict(p["text"][0], id="c1", role="callout", region="left_mid", style="callout_tag", text="Soft Maheshwari",
+                          start=4.5, end=6.5, beat=1, plate="#fbbf24", fill="#111111", animation="slide_left"))
+    side, ov = cp.callout_side(p)
+    assert side == "right_mid" and ov["left_mid"] > 0.02 >= ov["right_mid"]
+    assert "callout_head" in codes(p)
+    fixed = cp.repair_plan(p, [], CONCEPT, assets_info=ASSETS)
+    co = next(t for t in fixed["text"] if t["role"] == "callout")
+    assert co["region"] == "right_mid" and co["point"] == "shoulder"
+    assert "callout_head" not in codes(fixed)
+
+
+def test_brand_colour_has_two_beats_contrast_and_rim():
+    p = cp.default_plan(CONCEPT, ["#5a1230", "#a3321f"])
+    assert p["preset"] == "cutout_on_brand_colour" and len(p["background"]) >= 2
+    l0, l1 = (cp._bg_luma(b) for b in p["background"][:2])
+    assert l1 > l0 + 0.05 and cp._lum_contrast(l1, cp.SUBJECT_LUMA) >= cp.MIN_BG_CONTRAST
+    assert p["subject"]["rim"]["enabled"] and p["subject"]["rim"]["px"] >= 2  # dark first beat -> rim light
+    flat = copy.deepcopy(p)
+    flat["background"] = flat["background"][:1]
+    assert "bg_beats" in codes(flat)
+    dark_norim = copy.deepcopy(p)
+    dark_norim["subject"]["rim"]["enabled"] = False
+    assert "rim_light" in codes(dark_norim)
+    fixed = cp.repair_plan(flat, [], CONCEPT)
+    assert len(fixed["background"]) >= 2 and codes(fixed) == set() and fixed["subject"]["rim"]["enabled"]
+    # all-dark plan against a dark subject is lightened, not left flat
+    low = copy.deepcopy(p)
+    low["background"] = [dict(low["background"][0], colors=["#3a1020", "#2a0a1a"])]
+    low["preset"] = "cutout_on_brand_colour"
+    assert "bg_contrast" in codes(low)
+    assert cp._lum_contrast(max(cp._bg_luma(b) for b in cp.repair_plan(low, [], CONCEPT)["background"]), cp.SUBJECT_LUMA) >= cp.MIN_BG_CONTRAST
+
+
+def test_background_stills_need_explicit_no_people_flag():
+    assets = {"backdrops": [{"name": "unknown.png"}, {"name": "ok.png", "has_people": False},
+                            {"name": "desc.png", "has_people": False, "description": "a woman by the window"}]}
+    assert cp._asset_names(assets, "backdrops", people_ok=False) == {"ok.png"}
+    p = good()
+    p["background"][0].update(kind="blur_still", src="unknown.png")
+    assert "backdrop" in {x["code"] for x in cp.lint_plan(p, CONCEPT, RULES, assets_info=assets) if x["level"] == "error"}
+
+
+def test_beat_transitions_and_subject_scale():
+    p = good()
+    segs = p["subject"]["segments"]
+    assert "transition_in" not in segs[0]
+    assert all(s["transition_in"]["type"] in ("push", "flash", "dissolve") for s in segs[1:])
+    assert segs[1]["transition_in"] == {"type": "push", "dur": 0.25}
+    assert segs[-1]["transition_in"] == {"type": "flash", "dur": 0.15}
+    assert all(s["subject_scale"] == 1.0 for s in segs)
+    # head sizes differ per clip -> scale normalised to the median head, clamped
+    q = copy.deepcopy(p)
+    q["meta"]["head"] = {"top_frac": 0.29, "per_clip": {"a.mov": 0.20, "b.mov": 0.25}}
+    r = cp.repair_plan(q, [], CONCEPT)
+    sc = {s["clip"]: s["subject_scale"] for s in r["subject"]["segments"]}
+    assert sc["a.mov"] > 1.0 > sc["b.mov"] and all(0.85 <= v <= 1.15 for v in sc.values())
+    assert not list(VAL.iter_errors(r))
+    # a bad transition name is coerced, an old plan without the new keys still validates
+    q = copy.deepcopy(p)
+    q["subject"]["segments"][1]["transition_in"] = {"type": "wipe", "dur": 9}
+    assert cp.repair_plan(q, [], CONCEPT)["subject"]["segments"][1]["transition_in"] == {"type": "push", "dur": 0.6}
+    old = copy.deepcopy(p)
+    for s in old["subject"]["segments"]:
+        s.pop("transition_in", None), s.pop("subject_scale", None)
+    old["subject"].pop("rim")
+    assert not [x for x in cp.lint_plan(old, CONCEPT, RULES) if x["code"] == "schema"]
+
+
+def test_caption_chunks_3_to_6_words_and_08_to_20_s():
+    long = [{"text": "Maine pehli baar saree pehni aur mujhe bilkul bhi mushkil nahi hui kyunki ye bahut soft hai", "start": 0.0, "end": 6.0}]
+    out = cp.rechunk_captions(long)
+    assert out and all(3 <= len(c["text"].split()) <= 6 for c in out)
+    assert all(0.8 - 0.011 <= c["end"] - c["start"] <= 2.0 + 0.011 for c in out)
+    assert " ".join(c["text"] for c in out) == long[0]["text"]
+    p = good()
+    p["captions"].update(source="plan", chunks=[{"text": "ok", "start": 0.0, "end": 0.4}, {"text": "one two three four five six seven eight", "start": 0.4, "end": 8.0}])
+    assert "chunk_size" in codes(p)
+    fixed = cp.repair_plan(p, [], CONCEPT)
+    assert "chunk_size" not in codes(fixed) and codes(fixed) == set()
+    assert fixed["captions"]["chunking"] == {"words": [3, 6], "dur": [0.8, 2.0]}
+    # impossible timing (6 words in 0.3 s followed by speech) degrades to speech-timed captions, never blocks
+    q = good()
+    q["captions"].update(source="plan", chunks=[{"text": "a b c d e f", "start": 0.0, "end": 0.3}, {"text": "g h i j k l", "start": 0.3, "end": 0.5}])
+    r = cp.repair_plan(q, [], CONCEPT)
+    assert r["captions"]["source"] == "asr" and r["captions"]["chunks"] == [] and codes(r) == set()
+
+
+def test_prompt_lists_enum_values_literally_and_new_rules():
+    prompt = cp._build_prompt(CONCEPT, "b", "", ASSETS, "", None, [], head=HEAD)
+    for v in ("cutout_on_brand_colour", "pill_headline", "top_center", "slide_right", "dissolve", "flash", "devanagari", "shoulder", "black"):
+        assert json.dumps(v) in prompt
+    assert "at most 4 words" in prompt and "SPEAKER GEOMETRY" in prompt and "3-6 words" in prompt
+    # every enum in the table is real: it matches the schema
+    assert "- fps: 24 | 25 | 30" in prompt
+
+
+def test_plan_composition_passes_head_and_survives_invalid_enum():
+    bad = good()
+    bad["text"][0]["animation"] = "zoom_in"
+    bad["text"][0]["font"] = "comic"
+    bad["subject"]["segments"][1]["transition_in"] = {"type": "wipe", "dur": 0.2}
+    fake = Fake([bad])
+    p = run_plan(fake, head=HEAD)
+    assert len(fake.prompts) == 1 and "SPEAKER GEOMETRY" in fake.prompts[0]
+    assert p["meta"]["source"] == "spark" and p["meta"]["head"] == HEAD and p["meta"]["attempts"] == 1
+    assert not list(VAL.iter_errors(p)) and codes(p) == set()
+
+
+def test_default_plan_for_real_style_concept_is_clean():
+    c = dict(INTERNAL_CONCEPT, title="Beginner Ho Toh Bhi Comfortable")
+    c["beats"] = [{"clip": "IMG_1.mov", "src_in": 9.2, "src_out": 13.84, "on_screen_text": "Beginner with draping?"},
+                  {"clip": "IMG_2.MOV", "src_in": 5.1, "src_out": 8.6, "on_screen_text": "not comfortable in sarees?"},
+                  {"clip": "IMG_1.mov", "src_in": 15.5, "src_out": 18.5, "on_screen_text": "Maheshwari felt very comfortable"},
+                  {"clip": "IMG_2.MOV", "src_in": 10.5, "src_out": 13.5, "on_screen_text": "If you're new to sarees"}]
+    p = cp.default_plan(c, ["#5a1230", "#a3321f"], head=HEAD)
+    assert not list(VAL.iter_errors(p))
+    assert [x for x in cp.lint_plan(p, c, RULES) if x["level"] == "error"] == []
+    assert len(p["background"]) >= 2 and next(t for t in p["text"] if t["role"] == "cta")["text"] == "Shop Maheshwari"
+
+
+def test_keyword_is_a_bare_word_of_the_hook():
+    p = good()
+    next(t for t in p["text"] if t["role"] == "hook")["keyword"] = "fit?"
+    assert next(t for t in cp.repair_plan(p, [], CONCEPT)["text"] if t["role"] == "hook")["keyword"] == "fit"

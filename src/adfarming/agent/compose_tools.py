@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -56,6 +57,51 @@ FIELD_ALIASES = {"headline": "hook", "look_preset": "preset", "callout_text": "c
 LOOK_WORDS = re.compile(r"\b(background|backdrop|plate|colou?r|palette|gradient|textile|headline|callout|call-out|tag|"
                         r"caption|captions|text|font|bigger|larger|smaller|calmer|calm|busy|brighter|darker|look|"
                         r"overlay|card|pip|transition|dissolve|layout|style|scrim|contrast)\b", re.I)
+
+
+FIELD_MAX = 80             # hook / cta / title / callout, enforced at edit time
+CTA_MAX_WORDS = 4
+_INTERNAL = re.compile(r"\s[-\u2013\u2014]\s|\b(card|soft|end|fade|b-?roll|overlay|logo|cut to)\b", re.I)
+_CTA_FILLER = re.compile(r"^(?:see|watch|view|check out|explore|discover|visit)\s+(?:this|the|our|these)?\s*", re.I)
+_CTA_WEBSITE = re.compile(r"(?:see|watch|view|shop|explore|discover|check out)\s+(?:this|the|our|these)\s+(.+?)\s+"
+                          r"(?:on|at|from|in)\s+our\s+(?:website|site|store|app|page)", re.I)
+_ABS_PATH = re.compile(r"(?<![\w.])(?:[A-Za-z]:)?(?:/[^\s'\":,;()\[\]]+){2,}")
+
+
+def clean_detail(text: str, limit: int = 300) -> str:
+    """Event details must not leak absolute paths of the server: keep the file name only."""
+    return _ABS_PATH.sub(lambda m: m.group(0).rstrip("/").rsplit("/", 1)[-1], str(text or ""))[:limit]
+
+
+def check_field(key: str, value) -> str | None:
+    """None if a human-edited text field is acceptable, else the reason it is ignored."""
+    if not isinstance(value, str):
+        return f"{key} (must be text)"
+    if len(value.strip()) > FIELD_MAX:
+        return f"{key} (too long: {len(value.strip())} characters, the maximum is {FIELD_MAX})"
+    return None
+
+
+def cta_is_internal(text: str) -> bool:
+    return bool(_INTERNAL.search(text or ""))
+
+
+def short_cta(cta: str) -> str:
+    """The VISIBLE call to action: a short phrase (max 4 words) derived by code from the concept's cta field, which
+    may carry an internal direction ('See this Maheshwari on our website - soft end card'). Never shows a direction."""
+    raw = re.sub(r"\s+", " ", str(cta or "")).strip()
+    seg = re.split(r"\s[-\u2013\u2014]\s|[:;(\[\n]", raw)[0].strip(" .,!")
+    m = _CTA_WEBSITE.search(seg)
+    if m:
+        what = " ".join(m.group(1).split()[:2])
+        out = f"Shop {what}"
+    else:
+        words = _CTA_FILLER.sub("", seg).split() if len(seg.split()) > CTA_MAX_WORDS else seg.split()
+        out = " ".join(words[:CTA_MAX_WORDS])
+    out = out.strip(" .,!")
+    if not out or cta_is_internal(out) or len(out.split()) > CTA_MAX_WORDS:
+        out = "Shop now"
+    return out
 
 
 def look_mode() -> str:
@@ -146,6 +192,7 @@ def retime_plan(plan: dict, concept: dict, captions: list[dict], assets_info: di
     """Re-derive the plan from the (speech-snapped) concept, add the end hold so the CTA lands on a clean frame,
     and fill the speech-timed captions. Human-locked texts come from the concept (repair_plan forces them)."""
     p = _cp().repair_plan(plan, [], concept, assets_info=assets_info)
+    with_cta_short(p, concept, concept.get("cta_short"))
     total = float(p["duration"])
     d = round(total + hold_s, 2)
     p["duration"] = d
@@ -210,6 +257,87 @@ def apply_callout(plan: dict, text: str) -> tuple[dict, bool]:
     return p, True
 
 
+def _median(vals: list[float]) -> float:
+    v = sorted(vals)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+def head_meta(results: list[dict]) -> dict | None:
+    """plan["meta"]["head"] = {"top_frac", "bbox_frac"} from matte results (median over the stills/video)."""
+    tops = [float(r["head_top_frac"]) for r in results if isinstance(r, dict) and isinstance(r.get("head_top_frac"), (int, float))]
+    boxes = [r["subject_bbox_frac"] for r in results if isinstance(r, dict) and isinstance(r.get("subject_bbox_frac"), (list, tuple))
+             and len(r["subject_bbox_frac"]) == 4 and all(isinstance(x, (int, float)) for x in r["subject_bbox_frac"])]
+    if not tops and not boxes:
+        return None
+    head: dict = {}
+    if tops:
+        head["top_frac"] = round(_median(tops), 4)
+    if boxes:
+        head["bbox_frac"] = [round(_median([b[i] for b in boxes]), 4) for i in range(4)]
+    return head
+
+
+def set_head(plan: dict, results: list[dict]) -> dict:
+    h = head_meta(results)
+    if h:
+        plan["meta"] = dict(plan.get("meta") or {}, head=h)
+    return plan
+
+
+def with_cta_short(plan: dict, concept: dict, human_cta: str | None = None) -> dict:
+    """Every cta block gets `cta_short` equal to its visible text. The planner's repair already derives a short CTA;
+    a human's own CTA text is kept verbatim; if the visible text is still an internal direction (or too long) code
+    replaces it with a short phrase derived from the concept's cta field."""
+    human = human_cta.strip() if isinstance(human_cta, str) and human_cta.strip() else None
+    for t in plan.get("text") or []:
+        if t.get("role") != "cta":
+            continue
+        cur = (t.get("text") or "").strip()
+        if human:
+            cur = human
+        elif not cur or cta_is_internal(cur) or len(cur.split()) > CTA_MAX_WORDS:
+            cur = short_cta(concept.get("cta") or cur)
+        t["text"] = t["cta_short"] = cur
+    return plan
+
+
+def render_view(plan: dict) -> dict:
+    """The plan as handed to the renderer: the cta block shows cta_short, never the raw concept cta field."""
+    p = copy.deepcopy(plan)
+    for t in p.get("text") or []:
+        if t.get("role") == "cta":
+            t["text"] = t.get("cta_short") or short_cta(t.get("text") or "")
+    return p
+
+
+def preview_time(plan: dict, i: int, s: float, e: float) -> float:
+    """Where in background beat i (s..e) the preview still is taken: compose.best_preview_time when the renderer
+    has it, else the middle of the headline's on-screen window inside the beat (so the headline is visible)."""
+    from .. import compose
+    t = None
+    fn = getattr(compose, "best_preview_time", None)
+    if callable(fn):
+        for call in (lambda: fn(plan, s, e), lambda: fn(plan, i), lambda: fn(plan, (s, e))):
+            try:
+                v = call()
+                if isinstance(v, (int, float)):
+                    t = float(v)
+                    break
+            except Exception:
+                continue
+    if t is None:
+        hooks = [x for x in plan.get("text") or [] if x.get("role") == "hook"]
+        for h in hooks:
+            a, b = max(float(h.get("start", s)), s), min(float(h.get("end", e)), e)
+            if b - a > 0.1:
+                t = (a + b) / 2
+                break
+    if t is None:
+        t = (s + e) / 2
+    return round(min(max(t, s), max(s, e - 0.05)), 3)
+
+
 class ComposeFail(Exception):
     """A composed step failed in a way that triggers the fallback to the simple look."""
 
@@ -229,7 +357,9 @@ def d_make_plate(run, name: str, prompt: str, colors: list[str], out_path) -> st
     img = tint_dim(Image.open(io.BytesIO(data)), (colors or [None])[0])
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    img.save(out)
+    tmp = out.with_name(f".{out.stem}.part{out.suffix}")
+    img.save(tmp)
+    os.replace(tmp, out)                      # atomic: a half-written plate is never read as a cache hit
     run.trace("muse-image", {"prompt": prompt, "plate": name}, {"bytes": len(data)}, started=t0, cost_usd=PLATE_USD,
               artifacts=[str(out)], decision=f"background plate '{name}' (tinted, dimmed)")
     return str(out)
@@ -245,9 +375,10 @@ def d_matte_video(run, video, out_path, prompt: str = "woman", cache_dir=None) -
     return matte.extract_matte(run, video, out_path, prompt=prompt, cache_dir=cache_dir)
 
 
-def d_render(plan, assets, out_path, preview: bool = False, workdir=None) -> dict:
+def d_render(plan, assets, out_path, preview: bool = False, workdir=None, size=None) -> dict:
     from .. import compose
-    return compose.render_composition(plan, assets, out_path, preview=preview, workdir=workdir)
+    kw = {"size": tuple(size)} if size else {}
+    return compose.render_composition(plan, assets, out_path, preview=preview, workdir=workdir, **kw)
 
 
 def d_lint(plan, assets) -> list[str]:
@@ -255,18 +386,29 @@ def d_lint(plan, assets) -> list[str]:
     return compose.lint_render_inputs(plan, assets)
 
 
+HELPER_TIMEOUT_S = 120
+RATIO_SIZES = {"1x1": (1080, 1080), "16x9": (1920, 1080)}
+
+
 def _ff(args: list[str]) -> None:
-    p = subprocess.run(["ffmpeg", "-y", "-v", "error", *args], capture_output=True, text=True)
+    try:
+        p = subprocess.run(["ffmpeg", "-y", "-v", "error", *args], capture_output=True, text=True,
+                           timeout=HELPER_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise ComposeFail(f"ffmpeg helper timed out after {HELPER_TIMEOUT_S}s")
     if p.returncode:
-        raise RuntimeError(f"ffmpeg failed: {p.stderr.strip()[-400:]}")
+        raise RuntimeError(f"ffmpeg failed: {clean_detail(p.stderr.strip()[-400:], 400)}")
 
 
 def d_grab_frame(clip: dict, t: float, out_png) -> str:
     """One frame of the REAL footage at source time t, cover-fit to 1080x1920 like the master cut."""
     from .. import cuts
+    out = Path(out_png)
+    tmp = out.with_name(f".{out.stem}.part{out.suffix}")
     _ff(["-ss", f"{t:.3f}", "-i", str(cuts.clip_path(clip)), "-frames:v", "1", "-vf",
-         "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1", str(out_png)])
-    return str(out_png)
+         "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1", str(tmp)])
+    os.replace(tmp, out)
+    return str(out)
 
 
 def d_still_video(frames: list[tuple[str, float]], out_path, fps: int = 5) -> str:
@@ -323,9 +465,10 @@ class ComposeMixin:
         return look_mode()
 
     def _set_simple(self, step: str, reason: str, detail: str = "") -> None:
-        self._write("look.json", {"mode": "simple", "reason": reason, "detail": detail[:300], "step": step})
+        detail = clean_detail(detail)
+        self._write("look.json", {"mode": "simple", "reason": reason, "detail": detail, "step": step})
         self._ev("fallback", {"step": step, "from": "composed", "to": "simple", "scope": "look", "reason": reason,
-                              "detail": detail[:300]}, "system")
+                              "detail": detail}, "system")
 
     def _need_composed(self) -> None:
         if self.look() != "composed":
@@ -334,6 +477,12 @@ class ComposeMixin:
 
     def _cap_room(self, extra: float) -> bool:
         return self.spent() + self._cost_since(self._tool_mark) + extra <= _T().run_cap_usd() + SAM_SUFFIX_GUARD
+
+    @staticmethod
+    def _write_atomic_json(path: Path, obj) -> None:
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(obj, ensure_ascii=False))
+        os.replace(tmp, path)
 
     # ---------------- plans
     def plan_rec(self) -> dict | None:
@@ -389,7 +538,13 @@ class ComposeMixin:
             p, _ = force_preset(p, concept, locks["preset"], info)
         if isinstance(locks.get("callout"), str):
             p, _ = apply_callout(p, locks["callout"])
-        return cp.repair_plan(p, [], concept, assets_info=info)
+        p = cp.repair_plan(p, [], concept, assets_info=info)
+        human = (self._read("human_locks.json") or {}).get(concept.get("id"), {}).get("cta")
+        return with_cta_short(p, concept, human)
+
+    def _cta_pass(self, plan: dict, concept: dict) -> dict:
+        human = (self._read("human_locks.json") or {}).get(concept.get("id"), {}).get("cta")
+        return with_cta_short(plan, concept, human)
 
     def _plan_guidance(self, st: dict, extra: str) -> str:
         parts = [extra.strip()] if (extra or "").strip() else []
@@ -477,7 +632,7 @@ class ComposeMixin:
         plan = copy.deepcopy(rec["plan"])
         try:
             plates, failed = self._plates(plan)
-            plan_r = degrade_plates(plan, failed, wc)
+            plan_r = self._cta_pass(degrade_plates(plan, failed, wc), wc)
             files, notes, stats = self._preview_stills(plan_r, wc, plates, rec)
         except ComposeFail as e:
             return self._preview_fallback(st, str(e))
@@ -503,9 +658,10 @@ class ComposeMixin:
             raise ComposeFail("plan has no background")
         cache: dict[str, tuple[str, str]] = {}
         slots: list[tuple[str, str, float]] = []
+        heads: list[dict] = []
         n_new = n_cached = 0
-        for (s, e) in ranges:
-            mid = round((s + e) / 2, 3)
+        for i, (s, e) in enumerate(ranges):
+            mid = preview_time(plan, i, s, e)       # where the headline / callout is on screen
             bi, src_t = locate(wc, mid)
             clip_name = wc["beats"][bi]["clip"]
             clip = by_file.get(clip_name)
@@ -514,17 +670,25 @@ class ComposeMixin:
             key = hashlib.sha1(f"{clip_name}|{src_t:.2f}|{prompt}".encode()).hexdigest()[:12]
             if key not in cache:
                 frame, matte = wd / "frames" / f"f_{key}.png", self.dir / "mattes" / f"still_{key}.png"
-                if matte.exists() and frame.exists():
+                side = self.dir / "mattes" / f"still_{key}.json"
+                if matte.exists() and frame.exists() and side.exists():
                     n_cached += 1
+                    try:
+                        heads.append(json.loads(side.read_text()))
+                    except Exception:
+                        pass
                 else:
                     if not self._cap_room(STILL_USD):
                         raise _T().ToolError("cost_cap", "run cap would be exceeded by the next matte still", False,
                                              "stop spending: ask_human with what you have")
                     self.b.grab_frame(clip, src_t, frame)
                     t0 = time.time()
-                    res = self.b.matte_still(str(frame), str(matte), prompt)
+                    part = matte.with_name(f".{matte.stem}.part{matte.suffix}")
+                    res = self.b.matte_still(str(frame), str(part), prompt)
                     cost = float(res.get("cost_usd") or STILL_USD) if isinstance(res, dict) else STILL_USD
-                    ok = isinstance(res, dict) and not res.get("error") and Path(matte).exists()
+                    ok = isinstance(res, dict) and not res.get("error") and part.exists()
+                    if ok:
+                        os.replace(part, matte)       # atomic cache write
                     self.run.trace("sam-3.1-still", {"clip": clip_name, "t": src_t, "prompt": prompt},
                                    {"error": (res or {}).get("error")} if not ok else {"head_top_frac": res.get("head_top_frac")},
                                    started=t0, cost_usd=cost, status="ok" if ok else "error",
@@ -533,14 +697,21 @@ class ComposeMixin:
                     if not ok:
                         raise ComposeFail(f"matte still failed: {(res or {}).get('error')}")
                     n_new += 1
+                    h = {k: res.get(k) for k in ("head_top_frac", "subject_bbox_frac") if res.get(k) is not None}
+                    heads.append(h)
+                    self._write_atomic_json(side, h)
                 cache[key] = (str(frame), str(matte))
             slots.append((*cache[key], e - s))
+        set_head(plan, heads)       # the renderer places headline / callouts around the head from plan["meta"]["head"]
         master = self.b.still_video([(f, d) for f, _, d in slots], wd / "prev_master.mp4")
         matte = self.b.still_video([(m, d) for _, m, d in slots], wd / "prev_matte.mp4")
         assets = {"master": master, "matte": matte, "backdrops": {**plates, **self._assets()["backdrops"]},
                   "pip_images": self._assets()["pips"], "clips": {k: str(_clip_path(v)) for k, v in by_file.items()}}
         t0 = time.time()
-        out = self.b.render(plan, assets, wd / "stills", preview=True, workdir=wd / "work")
+        try:
+            out = self.b.render(render_view(plan), assets, wd / "stills", preview=True, workdir=wd / "work")
+        finally:
+            shutil.rmtree(wd / "work", ignore_errors=True)
         self.run.trace("ffmpeg-render", {"preview": True, "plan": rec["id"]}, {"frames": len(out.get("frames") or [])},
                        started=t0, cost_usd=PREVIEW_RENDER_USD, decision="deterministic preview stills (composed)")
         frames = out.get("frames") or []
@@ -557,6 +728,7 @@ class ComposeMixin:
 
     def _preview_fallback(self, st: dict, reason: str):
         T = _T()
+        reason = clean_detail(reason)
         self._set_simple("preview", "composition_preview_failed", reason)
         if not self._cap_room(0.04):
             raise T.ToolError("cost_cap", "run cap would be exceeded by the storyboard fallback", False,
@@ -616,6 +788,7 @@ class ComposeMixin:
         plan = degrade_plates(plan, failed, wc) if failed else plan
         if failed:  # degrade_plates re-runs repair_plan, which resets duration/captions: redo the retime
             plan = retime_plan(plan, wc, meta.get("captions") or [], assets["info"])
+        plan = self._cta_pass(plan, wc)
         prompt = subject_prompt or ((plan.get("subject") or {}).get("mask") or {}).get("prompt") or "woman"
         if not self._cap_room(est_edit(plan["duration"])[0] - QC_USD):
             raise T.ToolError("cost_cap", "run cap would be exceeded by the matte + render", False,
@@ -623,7 +796,8 @@ class ComposeMixin:
         mres = self.b.matte_video(self.run, master, self.dir / "work" / "matte.mp4", prompt,
                                   self.dir / "matte_cache")
         if not isinstance(mres, dict) or mres.get("error") or not mres.get("matte"):
-            raise ComposeFail(f"matte failed: {(mres or {}).get('error')}")
+            raise ComposeFail(f"matte failed: {clean_detail((mres or {}).get('error'), 200)}")
+        set_head(plan, [mres])           # head box from the matte: headline above the head, callouts at the margin
         clips = {k: str(_clip_path(v)) for k, v in self._clip_map().items()}
         rassets = {"master": str(master), "matte": mres["matte"], "backdrops": {**plates, **assets["backdrops"]},
                    "pip_images": assets["pips"], "clips": clips}
@@ -640,41 +814,75 @@ class ComposeMixin:
         for r, n in simple.items():
             if (self.dir / n).is_file():
                 kn = f"{cid}_simple_{r}.mp4"
-                if not (self.dir / kn).exists():
+                if n != kn:        # n is a fresh build_cuts output (meta was rebuilt): always refresh the saved copy
                     _copy(self.dir / n, self.dir / kn)
                 keep[r] = kn
+        work = self.dir / "work" / "compose"
+        view = render_view(plan)
         t0 = time.time()
-        rres = self.b.render(plan, rassets, self.dir / outs["9x16"], preview=False, workdir=self.dir / "work" / "compose")
-        render_s = round(time.time() - t0, 2)
-        self.run.trace("ffmpeg-render", {"plan": rec["id"] if rec else "default", "duration": plan["duration"]},
-                       {"seconds": (rres or {}).get("seconds"), "render_seconds": (rres or {}).get("render_seconds")},
-                       started=t0, cost_usd=RENDER_USD, artifacts=[str(self.dir / outs["9x16"])],
-                       decision=f"composed 9:16 render in {render_s}s")
-        if not (self.dir / outs["9x16"]).is_file():
-            raise ComposeFail("the renderer produced no 9:16 file")
-        top = mres.get("head_top_frac")
-        crop_y = max(0, min(840, int(top * 1920 - 0.20 * 1080))) if isinstance(top, (int, float)) else 160
-        for r in ("1x1", "16x9"):
-            t1 = time.time()
-            self.b.derive_ratio(self.dir / outs["9x16"], r, crop_y, self.dir / outs[r])
-            self.run.trace("ffmpeg-render", {"ratio": r}, {"file": outs[r]}, started=t1, cost_usd=0.0,
-                           artifacts=[str(self.dir / outs[r])],
-                           decision=f"derived {r} from the composed 9:16" + (f" (crop y={crop_y} from head-top)" if r == "1x1" else ""))
+        part9 = self.dir / f".{outs['9x16']}.part.mp4"
+        try:
+            rres = self.b.render(view, rassets, part9, preview=False, workdir=work)
+            render_s = round(time.time() - t0, 2)
+            self.run.trace("ffmpeg-render", {"plan": rec["id"] if rec else "default", "duration": plan["duration"]},
+                           {"seconds": (rres or {}).get("seconds"), "render_seconds": (rres or {}).get("render_seconds")},
+                           started=t0, cost_usd=RENDER_USD, artifacts=[outs["9x16"]],
+                           decision=f"composed 9:16 render in {render_s}s")
+            produced = Path((rres or {}).get("out") or part9)
+            if not produced.is_file():
+                raise ComposeFail("the renderer produced no 9:16 file")
+            os.replace(produced, self.dir / outs["9x16"])
+            ratios = {"9x16": "composed"}
+            for r, size in RATIO_SIZES.items():
+                ratios[r] = self._render_ratio(r, size, view, rassets, outs[r], keep.get(r), work)
+        finally:
+            part9.unlink(missing_ok=True)
+            shutil.rmtree(work, ignore_errors=True)
         verdict, hist = self._qc_composed(st, wc, meta, self.dir / outs["9x16"])
         comp = {"plan_id": rec["id"] if rec else "default", "plan": plan, "matte": {k: mres.get(k) for k in
-                ("frames", "sampled_frames", "cost_usd", "head_top_frac", "cached", "seconds")},
+                ("frames", "sampled_frames", "cost_usd", "head_top_frac", "subject_bbox_frac", "cached", "seconds")},
                 "render_seconds": render_s, "lint": lint, "plates": sorted(plates), "plates_failed": failed,
-                "crop_y": crop_y}
+                "ratios": ratios}
         self._write("composition.json", comp)
-        meta.update(cuts=outs, simple_cuts=keep or simple, look="composed", plan_id=comp["plan_id"], qc=verdict,
+        meta.update(cuts=outs, simple_cuts=keep or simple, simple_sig=meta.get("beats_sig"), ratios=ratios, look="composed", plan_id=comp["plan_id"], qc=verdict,
                     qc_history=hist, composed={k: v for k, v in comp.items() if k != "plan"})
         self._write("meta.json", meta)
         T.gates.propose_artifact(self.run_id, "edit", "cuts", ref="meta.json")
         T.gates.propose_artifact(self.run_id, "check", "qc", ref="meta.json")
         return {"look": "composed", "plan_id": comp["plan_id"], "cuts": outs, "render_seconds": render_s,
-                "matte": comp["matte"], "lint": lint[:6], "plates_failed": failed,
+                "matte": comp["matte"], "lint": lint[:6], "plates_failed": failed, "ratios": ratios,
                 "qc": {"pass": verdict.get("pass"), "score": verdict.get("score"),
                        "issues": (verdict.get("issues") or [])[:5], "summary": verdict.get("summary")}}
+
+    def _render_ratio(self, r: str, size: tuple[int, int], view: dict, rassets: dict, out_name: str,
+                      simple_name: str | None, work: Path) -> str:
+        """Render one ratio with its own layout (the renderer picks safe zones from `size`). A ratio the renderer
+        cannot make good, or that fails, keeps the SIMPLE cut for that ratio and is marked 'simple'."""
+        t1 = time.time()
+        dst = self.dir / out_name
+        part = self.dir / f".{out_name}.part.mp4"
+        status, why = "composed", ""
+        try:
+            res = self.b.render(view, rassets, part, preview=False, workdir=work / r, size=size)
+            produced = Path((res or {}).get("out") or part)
+            if isinstance(res, dict) and (res.get("unsupported") or res.get("ok") is False):
+                status, why = "simple", str(res.get("reason") or "layout not supported")
+            elif not produced.is_file():
+                status, why = "simple", "renderer produced no file"
+            else:
+                os.replace(produced, dst)
+        except Exception as e:
+            status, why = "simple", f"{type(e).__name__}: {e}"
+        finally:
+            part.unlink(missing_ok=True)
+        if status == "simple":
+            if simple_name and (self.dir / simple_name).is_file():
+                _copy(self.dir / simple_name, dst)
+        self.run.trace("ffmpeg-render", {"ratio": r}, {"file": out_name, "status": status}, started=t1, cost_usd=0.0,
+                       artifacts=[out_name],
+                       decision=(f"composed {r} render" if status == "composed" else
+                                 f"{r}: composed layout not available ({clean_detail(why, 120)}); the simple cut is kept"))
+        return status
 
     def _qc_composed(self, st: dict, wc: dict, meta: dict, video: Path) -> tuple[dict, list[dict]]:
         hist = list(meta.get("qc_history") or [])
@@ -695,11 +903,13 @@ class ComposeMixin:
     def _render_fallback(self, st: dict, wc: dict, meta: dict, reason: str):
         """The composed render failed: keep the simple cuts, review those, say so loudly (event + result)."""
         T = _T()
+        reason = clean_detail(reason)
         self._set_simple("edit", "composed_render_failed", reason)
         simple = dict(meta.get("simple_cuts") or meta.get("cuts") or {})
         meta["cuts"] = simple
         meta["look"] = "simple_fallback"
-        meta["fallback_reason"] = reason[:300]
+        reason = clean_detail(reason, 300)
+        meta["fallback_reason"] = reason
         verdict = {"pass": None, "score": None, "issues": [], "fixes": [], "summary": "QC skipped"}
         if "9x16" in simple and self._cap_room(QC_USD):
             verdict = self.b.review(self.run, self._qc_brief(st), wc, meta.get("captions") or [], self.dir / simple["9x16"])
@@ -721,15 +931,42 @@ class ComposeMixin:
         version, frames stale). hook/cta/title are concept locks handled by the caller. Returns (applied, ignored)."""
         applied, ignored = [], []
         locks = self.plan_locks()
-        if "callout" in fields and isinstance(fields["callout"], str):
-            locks["callout"] = fields["callout"].strip()
-            applied.append("callout")
-        if "preset" in fields:
-            if fields["preset"] in LOOK_PRESETS:
-                locks["preset"] = fields["preset"]
-                applied.append("preset")
+        rec = self.plan_current(st) or self.plan_rec()
+        plan = rec["plan"] if rec else None
+        try:
+            wc = self._freeze(copy.deepcopy(self.working_concept(st)))
+        except Exception:
+            wc = None
+        if "callout" in fields:
+            bad = check_field("callout", fields["callout"])
+            if bad:
+                ignored.append(bad)
             else:
+                text = fields["callout"].strip()
+                if plan is None:
+                    ok = True                      # no plan yet: the lock is applied when the plan is made
+                else:
+                    ok = apply_callout(plan, text)[1]
+                if ok:
+                    locks["callout"] = text
+                    applied.append("callout")
+                else:
+                    ignored.append("callout (the current plan has no callout block to put the text in)")
+        if "preset" in fields:
+            if fields["preset"] not in LOOK_PRESETS:
                 ignored.append(f"preset (unknown: choose one of {list(LOOK_PRESETS)})")
+            else:
+                ok = True
+                if plan is not None and wc is not None:
+                    try:
+                        ok = force_preset(plan, wc, fields["preset"], self._assets()["info"])[1]
+                    except Exception:
+                        ok = False
+                if ok:
+                    locks["preset"] = fields["preset"]
+                    applied.append("preset")
+                else:
+                    ignored.append(f"preset ({fields['preset']} cannot be applied: the footage/plan lacks what it needs)")
         self._write("plan_locks.json", locks)
         return applied, ignored
 

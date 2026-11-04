@@ -397,7 +397,10 @@ class Toolbox(ComposeMixin):
         return events.append_event(self.run_id, kind, actor, payload, reason)
 
     def _write(self, name: str, obj: Any) -> None:
-        (self.dir / name).write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+        f = self.dir / name        # atomic: a reader (or a crash) never sees a half-written json
+        tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+        os.replace(tmp, f)
 
     def _read(self, name: str, default: Any = None) -> Any:
         f = self.dir / name
@@ -530,11 +533,16 @@ class Toolbox(ComposeMixin):
         self._write("working_concept.json",
                     {"from_gate": st["step_approval"]["ideas"]["gate_id"], "concept": concept})
 
-    def _lock_fields(self, cid: str, fields: dict) -> None:
-        """Remember fields a human edited so no automatic revision can overwrite them."""
-        d = self._read("human_locks.json") or {}
-        d.setdefault(cid, {}).update(fields)
-        self._write("human_locks.json", d)
+    def _lock_fields(self, cid: str, fields: dict) -> dict:
+        """Remember fields a human edited so no automatic revision can overwrite them. Fields over the length limit
+        are not locked; returns {field: reason} for those."""
+        rejected = {k: r for k, v in fields.items() if (r := compose_tools.check_field(k, v))}
+        good = {k: v for k, v in fields.items() if k not in rejected}
+        if good:
+            d = self._read("human_locks.json") or {}
+            d.setdefault(cid, {}).update(good)
+            self._write("human_locks.json", d)
+        return rejected
 
     def _freeze(self, concept: dict) -> dict:
         """Re-apply human-edited hook/cta/title to a concept (human edits always win)."""
@@ -543,6 +551,8 @@ class Toolbox(ComposeMixin):
             concept[k] = v
         if "hook" in locks and concept.get("beats"):
             concept["beats"][0]["on_screen_text"] = locks["hook"]
+        if isinstance(locks.get("cta"), str) and locks["cta"].strip():
+            concept["cta_short"] = locks["cta"].strip()      # the human's own CTA words are what shows on screen
         return concept
 
     def _stale(self, names_steps: list[tuple[str, str]]) -> None:
@@ -982,12 +992,18 @@ class Toolbox(ComposeMixin):
             def put(c: dict) -> None:
                 locked = {}
                 for k in ("hook", "cta", "title"):
-                    if k in fields and isinstance(fields[k], str):
+                    if k in fields:
+                        bad = compose_tools.check_field(k, fields[k])
+                        if bad:
+                            ignored.append(bad)
+                            continue
                         c[k] = fields[k]
                         locked[k] = fields[k]
+                        if k == "cta":
+                            c["cta_short"] = fields[k].strip()
                         applied.append(k)
-                if "hook" in fields and c.get("beats"):
-                    c["beats"][0]["on_screen_text"] = fields["hook"]
+                if "hook" in locked and c.get("beats"):
+                    c["beats"][0]["on_screen_text"] = locked["hook"]
                 if locked:
                     self._lock_fields(c["id"], locked)
             if step == "ideas":
@@ -1015,7 +1031,7 @@ class Toolbox(ComposeMixin):
                                  "beats changed), then ask_human." if composed else
                                  "Rebuild with build_cuts, then ask_human.")
                 else:
-                    if composed and applied:
+                    if composed and step == "preview" and applied:
                         pid = self.replan_by_code(st)   # new plan version by code, frames go stale
                         if pid:
                             note_next = (f"The plan was updated by the system to {pid}. Re-render the stills with "

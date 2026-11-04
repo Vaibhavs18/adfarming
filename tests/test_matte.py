@@ -212,3 +212,115 @@ def test_extract_matte_still_mocked(tmp_path, monkeypatch):
     err = M.extract_matte_still(tmp_path / "s.png", tmp_path / "b.png")
     assert "no match" in err["error"] and err["matte"] is None
     assert "error" in M.extract_matte_still(tmp_path / "missing.png", tmp_path / "b.png")
+
+
+# ---------------------------------------------------------------- F3: stats, cost on failure, procs, atomic cache
+
+def test_subject_stats_median_bbox_and_head_size():
+    toks = {}
+    for f, (x1, y1, x2, y2) in enumerate([(8, 10, 22, 30), (8, 12, 22, 32), (10, 14, 24, 34)]):
+        toks[f] = {"box": (x1, y1, x2, y2), "w": 32, "h": 48}
+    st = M.subject_stats(toks)
+    assert st["subject_bbox_frac"] == [round(8 / 32, 4), round(12 / 48, 4), round(22 / 32, 4), round(32 / 48, 4)]
+    assert st["head_top_frac"] == st["subject_bbox_frac"][1] == round(12 / 48, 4)
+    assert st["head_size_frac"] == round(20 / 48, 4)
+    none = M.subject_stats({})
+    assert none["subject_bbox_frac"] is None and none["head_top_frac"] is None and none["head_size_frac"] is None
+    clamp = M.subject_stats({0: {"box": (-5, -5, 40, 60), "w": 32, "h": 48}})
+    assert clamp["subject_bbox_frac"] == [0.0, 0.0, 1.0, 1.0]
+
+
+def test_extract_matte_reports_bbox_and_head_size_and_caches_them(tmp_path, run, monkeypatch, mocked):
+    vid = tmp_path / "v.mp4"
+    make_video(vid)
+    monkeypatch.setattr(M, "_sam_call", lambda *a, **k: sam_text(range(10)))
+    res = M.extract_matte(run, vid, tmp_path / "m.mp4", sample_fps=5, width=32, cache_dir=tmp_path / "c", procs=1)
+    assert res["subject_bbox_frac"] == [0.25, round(10 / 48, 4), round(22 / 32, 4), round(30 / 48, 4)]
+    assert res["head_size_frac"] == round(20 / 48, 4)
+    again = M.extract_matte(run, vid, tmp_path / "m2.mp4", sample_fps=5, width=32, cache_dir=tmp_path / "c", procs=1)
+    assert again["cached"] and again["subject_bbox_frac"] == res["subject_bbox_frac"] and again["head_size_frac"] == res["head_size_frac"]
+    assert not list((tmp_path / "c").rglob("*.tmp"))  # atomic writes leave no temp files
+
+
+def test_cost_recorded_on_failure_including_person_retry(tmp_path, run, monkeypatch, mocked):
+    vid = tmp_path / "v.mp4"
+    make_video(vid)
+    monkeypatch.setattr(M, "_sam_call", lambda *a, **k: "")
+    res = M.extract_matte(run, vid, tmp_path / "m.mp4", sample_fps=5, width=32, cache_dir=tmp_path / "c")
+    assert "no match" in res["error"] and res["sam_calls"] == 2
+    assert res["cost_usd"] == pytest.approx(2 * 50 * M.COST_PER_FRAME_USD)
+
+    seen = []
+
+    def second_fails(part, prompt, deadline, mask_encoding="one_bit"):
+        seen.append(prompt)
+        if prompt == "woman":
+            return ""
+        raise M.MatteError("SAM HTTP 500")
+
+    monkeypatch.setattr(M, "_sam_call", second_fails)
+    res = M.extract_matte(run, vid, tmp_path / "m.mp4", sample_fps=5, width=32, cache_dir=tmp_path / "c2")
+    assert seen == ["woman", "person"] and res["cost_usd"] == pytest.approx(2 * 50 * M.COST_PER_FRAME_USD)
+    # the trace carries the same cost (spend is visible in the run ledger)
+    assert any(abs((e.get("cost_usd") or 0) - res["cost_usd"]) < 1e-9 for e in _trace_events(run))
+
+
+def _trace_events(run):
+    import json
+    out = []
+    for f in Path(run.dir).rglob("*.jsonl"):
+        out += [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+    return out
+
+
+def test_still_cost_on_failure_and_stats(tmp_path, monkeypatch):
+    Image.new("RGB", (80, 120), (9, 9, 9)).save(tmp_path / "s.png")
+    monkeypatch.setattr(M, "_sam_call", lambda *a, **k: "")
+    err = M.extract_matte_still(tmp_path / "s.png", tmp_path / "a.png")
+    assert err["cost_usd"] == pytest.approx(2 * M.COST_PER_IMAGE_USD)
+    monkeypatch.setattr(M, "_sam_call", lambda *a, **k: token(None, (8, 10, 22, 30), blob(20, 14), fw=80, fh=120))
+    ok = M.extract_matte_still(tmp_path / "s.png", tmp_path / "a.png")
+    assert ok["subject_bbox_frac"] == [0.1, round(10 / 120, 4), 0.275, round(30 / 120, 4)]
+    assert ok["head_top_frac"] == round(10 / 120, 4) and ok["head_size_frac"] == round(20 / 120, 4)
+
+
+def test_decode_procs_env_default_and_affinity_cap(monkeypatch):
+    monkeypatch.delenv("ADF_DECODE_PROCS", raising=False)
+    monkeypatch.setattr(M, "available_cpus", lambda: 8)
+    assert M.decode_procs() == 2                      # default 2
+    monkeypatch.setenv("ADF_DECODE_PROCS", "4")
+    assert M.decode_procs() == 4
+    monkeypatch.setenv("ADF_DECODE_PROCS", "junk")
+    assert M.decode_procs() == 2
+    monkeypatch.setenv("ADF_DECODE_PROCS", "6")
+    monkeypatch.setattr(M, "available_cpus", lambda: 2)  # 2 vCPU container: never oversubscribe
+    assert M.decode_procs() == 2 and M.decode_procs(8) == 2
+    assert M.decode_procs(1) == 1
+
+
+def test_available_cpus_uses_affinity(monkeypatch):
+    monkeypatch.setattr(M.os, "sched_getaffinity", lambda pid: {0, 1, 2}, raising=False)
+    assert M.available_cpus() == 3
+    monkeypatch.delattr(M.os, "sched_getaffinity", raising=False)
+    assert M.available_cpus() >= 1
+
+
+def test_atomic_write_replaces_and_leaves_no_temp(tmp_path):
+    d = tmp_path / "x" / "f.bin"
+    M._atomic_write(d, data=b"one")
+    M._atomic_write(d, data=b"two")
+    assert d.read_bytes() == b"two" and [p.name for p in d.parent.iterdir()] == ["f.bin"]
+
+
+def test_failed_matte_leaves_no_partial_output_or_cache(tmp_path, run, monkeypatch, mocked):
+    vid = tmp_path / "v.mp4"
+    make_video(vid)
+    monkeypatch.setattr(M, "_sam_call", lambda *a, **k: sam_text(range(10)))
+
+    def bad_write(*a, **k):
+        raise M.MatteError("ffmpeg matte encode failed: boom")
+
+    monkeypatch.setattr(M, "_write_matte", bad_write)
+    res = M.extract_matte(run, vid, tmp_path / "m.mp4", sample_fps=5, width=32, cache_dir=tmp_path / "c", procs=1)
+    assert "boom" in res["error"] and not (tmp_path / "m.mp4").exists()
+    assert not list((tmp_path / "c").rglob("meta.json"))

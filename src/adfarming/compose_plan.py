@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import statistics
 import time
 from pathlib import Path
 
@@ -48,6 +49,24 @@ REGION_CAP = {"top_center": 44, "left_mid": 24, "right_mid": 24, "bottom_caption
 MIN_BLOCK_S = 0.8
 MAX_PLATE_DIM = 0.7
 MIN_SCRIM = 0.35
+MAX_TEXT_CHARS = 80          # hook / cta / title / callout, enforced at edit time too (schema maxLength agrees)
+CTA_MAX_WORDS = 4
+CTA_MAX_CHARS = 28
+CAPTION_WORDS = (3, 6)       # words per caption chunk
+CAPTION_SECS = (0.8, 2.0)    # seconds per caption chunk
+HEADLINE_TOP_PX = 190        # where a top_center headline starts (below the platform UI zone)
+HEADLINE_GAP_PX = 28         # air between the last headline line and the top of the head
+HEADLINE_MIN_SIZE = 56
+DEFAULT_HEAD_TOP = 0.29      # used only when the agent supplied a head box without top_frac
+SUBJECT_LUMA = 0.04          # a dark saree: relative luminance assumed when the matte did not measure it
+MIN_BG_CONTRAST = 1.6        # background vs subject luminance contrast ratio
+RIM_LUMA = 0.2               # below this background luminance the subject gets a light rim / outer glow
+CALLOUT_W = 0.30             # callout box width as a fraction of frame width (side margins)
+HEAD_HALF_W = 0.13           # half head width as a fraction of frame width
+# words that mark an internal direction (note to the editor), never copy for the screen
+_CTA_INTERNAL = re.compile(r"(\s[-\u2013\u2014]\s|\b(card|soft|end|hold|held|direction|readable|outro|overlay|b-?roll|clip|beat)\b)", re.I)
+_CTA_STOP = {"if", "you", "your", "you're", "youre", "i", "we", "see", "this", "that", "the", "on", "our", "website", "new",
+             "to", "a", "an", "of", "and", "or", "in", "at", "it", "is", "are", "for", "with", "check", "visit", "shop"}
 
 _PRICE = re.compile(r"(₹|\brs\.?\s*\d|\brupees?\b|\binr\b|[$€£]|\d\s*%|%\s*off|\bdiscounts?\b|\bsale\b|\bprice[sd]?\b|"
                     r"\bcheap(er|est)?\b|\bfree shipping\b|\bcoupon\b|\bcod\b|\bmrp\b|\boffer\b|\bdeal\b)", re.I)
@@ -116,11 +135,59 @@ def total_duration(concept: dict) -> float:
 
 def _hook_text(concept: dict) -> str:
     beats = concept.get("beats") or []
-    return ((beats[0].get("on_screen_text") if beats else "") or "").strip()
+    return clip_text(((beats[0].get("on_screen_text") if beats else "") or "").strip())
+
+
+def cta_issue(text: str) -> str | None:
+    """Why `text` may not be shown as the on-screen CTA, or None when it is a clean short CTA."""
+    t = (text or "").strip()
+    if not t:
+        return "empty"
+    m = _CTA_INTERNAL.search(t)
+    if m:
+        return f"looks like an internal direction ({m.group(0).strip()!r})"
+    if len(t.split()) > CTA_MAX_WORDS:
+        return f"more than {CTA_MAX_WORDS} words"
+    if len(t) > CTA_MAX_CHARS:
+        return f"longer than {CTA_MAX_CHARS} characters"
+    return None
+
+
+def derive_cta_short(concept: dict) -> str:
+    """A short on-screen CTA (<= 4 words) from the concept: 'Shop <Product>' when the long cta names one."""
+    cta = concept.get("cta") or ""
+    m = re.search(r"\b(?:see|shop|explore|check out|find|try)\s+(?:the|this|our|these|that)?\s*([A-Za-z\u0900-\u097F]+)\s+(?:on|at|online|in|now)\b", cta, re.I)
+    pick = m.group(1) if m and m.group(1).lower() not in _CTA_STOP else ""
+    if not pick:
+        caps = [w for w in re.findall(r"[A-Za-z][A-Za-z'-]*", cta) if w[:1].isupper() and w.lower() not in _CTA_STOP]
+        pick = caps[0] if caps else ""
+    pick = pick[:1].upper() + pick[1:]
+    out = f"Shop {pick}" if pick else "See it online"
+    return out if not cta_issue(out) else "See it online"
+
+
+def locked_cta(concept: dict) -> str | None:
+    """The CTA the human fixed: an explicit concept['cta_short'], else a concept cta that is itself a clean short CTA."""
+    explicit = (concept.get("cta_short") or "").strip()
+    if explicit:
+        return explicit[:MAX_TEXT_CHARS]
+    plain = (concept.get("cta") or "").strip()
+    if plain and not cta_issue(plain):
+        return plain
+    return None
 
 
 def _cta_text(concept: dict) -> str:
-    return (concept.get("cta") or "").strip()
+    """The VISIBLE cta text (short). Empty when the concept has no call to action at all."""
+    if not ((concept.get("cta") or "").strip() or (concept.get("cta_short") or "").strip()):
+        return ""
+    return locked_cta(concept) or derive_cta_short(concept)
+
+
+def clip_text(text: str, cap: int = MAX_TEXT_CHARS) -> str:
+    """Hard cap for any on-screen text; cuts on a word boundary. Used at edit time by the agent too."""
+    t = (text or "").strip()
+    return t if len(t) <= cap else _short(t, cap)
 
 
 def _concept_texts(concept: dict) -> str:
@@ -142,7 +209,9 @@ def hard_rules_from_memory(memory_text: str) -> list[str]:
 def _asset_names(assets_info: dict | None, key: str, *, people_ok: bool) -> set[str]:
     out = set()
     for a in (assets_info or {}).get(key, []) or []:
-        if isinstance(a, dict) and a.get("name") and (people_ok or not a.get("has_people")):
+        if not (isinstance(a, dict) and a.get("name")):
+            continue
+        if people_ok or (a.get("has_people") is False and not _PEOPLE.search(str(a.get("description") or ""))):
             out.add(a["name"])
     return out
 
@@ -151,6 +220,156 @@ def _bg_colors(bg: dict) -> list[str]:
     cols = [c for c in (bg.get("colors") or []) if _is_hex(c)] or ["#2a1020"]
     dim = _clamp(_num(bg.get("dim"), 1.0), 0.2, 1.0)
     return [_darken(c, dim) for c in cols]
+
+
+
+def _bg_luma(bg: dict) -> float:
+    cols = _bg_colors(bg)
+    return sum(_lum(c) for c in cols) / len(cols)
+
+
+def _lum_contrast(l1: float, l2: float) -> float:
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _mix_white(h: str, f: float) -> str:
+    r, g, b = _hex_rgb(h)
+    return "#%02x%02x%02x" % (int(r + (255 - r) * f), int(g + (255 - g) * f), int(b + (255 - b) * f))
+
+
+def _head(plan: dict) -> dict | None:
+    h = (plan.get("meta") or {}).get("head")
+    return h if isinstance(h, dict) else None
+
+
+def _head_top(plan: dict) -> float | None:
+    h = _head(plan)
+    if not h:
+        return None
+    t = h.get("top_frac")
+    return float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 < t < 1 else DEFAULT_HEAD_TOP
+
+
+def _subject_luma(plan: dict) -> float:
+    v = ((plan.get("meta") or {}).get("subject") or {}).get("luma")
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else SUBJECT_LUMA
+
+
+def headline_height_px(text: str, size: int, stroke: int = 8) -> int:
+    """Estimated height of a wrapped top_center headline (bold face ~0.56 em per char over a 960 px column)."""
+    chars = max(1, len(text or ""))
+    lines = max(1, -(-int(chars * 0.56 * size) // 960))
+    return int(lines * size * 1.15 + 2 * stroke)
+
+
+def headline_room_px(plan: dict) -> int | None:
+    """Pixels between the headline top and the head top, or None when no head box is known."""
+    top = _head_top(plan)
+    if top is None:
+        return None
+    return int(top * 1920) - HEADLINE_TOP_PX - HEADLINE_GAP_PX
+
+
+def _fit_size(text: str, size: int, room: int, stroke: int = 8) -> int:
+    while size > HEADLINE_MIN_SIZE and headline_height_px(text, size, stroke) > room:
+        size -= 4
+    return max(size, HEADLINE_MIN_SIZE)
+
+
+def callout_side(plan: dict) -> tuple[str, dict]:
+    """Which side margin ('left_mid'|'right_mid') is farther from the head, with the horizontal overlap of each side
+    callout box against the head box ({region: overlap_frac}). Without a head box: right_mid, no overlaps."""
+    h = _head(plan)
+    bb = h.get("bbox_frac") if h else None
+    if not (isinstance(bb, (list, tuple)) and len(bb) == 4 and all(isinstance(v, (int, float)) for v in bb)):
+        return "right_mid", {}
+    cx = (bb[0] + bb[2]) / 2
+    hx1, hx2 = cx - HEAD_HALF_W, cx + HEAD_HALF_W
+    boxes = {"left_mid": (0.04, 0.04 + CALLOUT_W), "right_mid": (0.96 - CALLOUT_W, 0.96)}
+    ov = {r: round(max(0.0, min(b[1], hx2) - max(b[0], hx1)), 3) for r, b in boxes.items()}
+    # tie: the side with more free margin
+    best = min(ov, key=lambda r: (ov[r], -(bb[0] if r == "left_mid" else 1 - bb[2])))
+    return best, ov
+
+
+def rechunk_captions(chunks: list[dict], words=CAPTION_WORDS, secs=CAPTION_SECS) -> list[dict] | None:
+    """Re-cut caption chunks to 3-6 words and 0.8-2.0 s. Word timing is spread over each source chunk by letter count.
+    Returns None when the rule cannot be met (the caller then falls back to ASR-timed captions)."""
+    lo_w, hi_w = words
+    lo_s, hi_s = secs
+    toks: list[tuple[str, float, float]] = []
+    for c in chunks:
+        ws = str(c.get("text") or "").split()
+        s, e = _num(c.get("start")), _num(c.get("end"))
+        tot = sum(len(w) for w in ws) or 1
+        t = s
+        for w in ws:
+            d = (e - s) * len(w) / tot
+            toks.append((w, t, t + d))
+            t += d
+    if not toks:
+        return []
+    groups: list[list[tuple[str, float, float]]] = []
+    cur: list[tuple[str, float, float]] = []
+    for tk in toks:
+        if cur and (len(cur) >= hi_w or tk[2] - cur[0][1] > hi_s or (len(cur) >= lo_w and cur[-1][0][-1:] in ".?!")):
+            groups.append(cur)
+            cur = []
+        cur.append(tk)
+    if cur:
+        groups.append(cur)
+
+    def span(g):
+        return g[-1][2] - g[0][1]
+
+    def fits(g):
+        return len(g) <= hi_w and span(g) <= hi_s + 1e-6
+    i = 0
+    while i < len(groups):  # merge too-short groups into a neighbour
+        g = groups[i]
+        if len(g) < lo_w or span(g) < lo_s - 1e-6:
+            if i > 0 and fits(groups[i - 1] + g):
+                groups[i - 1] = groups[i - 1] + g
+                del groups[i]
+                continue
+            if i + 1 < len(groups) and fits(g + groups[i + 1]):
+                groups[i + 1] = g + groups[i + 1]
+                del groups[i]
+                continue
+            # neither neighbour can absorb it whole: rebalance the two so both are long enough
+            for j in (i - 1, i + 1):
+                if 0 <= j < len(groups):
+                    pair = (groups[j] + g) if j < i else (g + groups[j])
+                    cut = len(pair) // 2
+                    a1, a2 = pair[:cut], pair[cut:]
+                    if all(len(x) >= lo_w and span(x) >= lo_s - 1e-6 and fits(x) for x in (a1, a2)):
+                        groups[min(i, j)], groups[max(i, j)] = a1, a2
+                        break
+        i += 1
+    out = []
+    for k, g in enumerate(groups):
+        s, e = g[0][1], g[-1][2]
+        nxt = groups[k + 1][0][1] if k + 1 < len(groups) else 1e9
+        if e - s < lo_s - 1e-6:
+            e = min(s + lo_s, nxt)  # hold on screen a little longer if the gap allows it
+        out.append({"text": " ".join(w for w, _, _ in g), "start": round(s, 2), "end": round(e, 2)})
+    bad = [c for c in out if not (lo_w <= len(c["text"].split()) <= hi_w) or not (lo_s - 0.011 <= c["end"] - c["start"] <= hi_s + 0.011)]
+    if bad and len(toks) >= lo_w:
+        return None
+    return out
+
+
+def _chunk_problems(chunks, words=CAPTION_WORDS, secs=CAPTION_SECS) -> list[tuple[int, str]]:
+    out = []
+    for i, c in enumerate(chunks or []):
+        n = len(str(c.get("text") or "").split())
+        d = _num(c.get("end")) - _num(c.get("start"))
+        if not words[0] <= n <= words[1]:
+            out.append((i, f"{n} words (must be {words[0]}-{words[1]})"))
+        elif not secs[0] - 0.011 <= d <= secs[1] + 0.011:
+            out.append((i, f"{d:.1f}s on screen (must be {secs[0]}-{secs[1]}s)"))
+    return out
 
 
 # ---------------------------------------------------------------- lint
@@ -219,6 +438,21 @@ def _lint_semantics(plan, concept, hard_rules, assets_info) -> list[dict]:
     if starts != sorted(starts):
         probs.append(_p("timing", "background", "backgrounds must be in time order"))
 
+    # backgrounds: at least 2 beats on the brand-colour preset, contrast vs the subject, rim light on dark backgrounds
+    if plan.get("preset") == "cutout_on_brand_colour" and dur >= 6 and len(bgs) < 2:
+        probs.append(_p("bg_beats", "background", "brand-colour preset needs at least 2 background beats (a lighter second gradient "
+                        "from about the middle) so the reel is not one flat colour"))
+    if bgs:
+        sl = _subject_luma(plan)
+        ratios = [_lum_contrast(_bg_luma(b), sl) for b in bgs if isinstance(b, dict)]
+        rim = ((plan.get("subject") or {}).get("rim") or {})
+        if ratios and max(ratios) < MIN_BG_CONTRAST:
+            probs.append(_p("bg_contrast", "background", f"no background beat separates from the subject (luminance contrast "
+                            f"{max(ratios):.2f} < {MIN_BG_CONTRAST}); use a lighter beat"))
+        if any(_bg_luma(b) < RIM_LUMA for b in bgs if isinstance(b, dict)) and not (rim.get("enabled") and _num(rim.get("px")) >= 2):
+            probs.append(_p("rim_light", "subject/rim", f"a background is darker than luma {RIM_LUMA}: enable subject.rim (>= 2 px light "
+                            "rim / outer glow)"))
+
     # preset consistency
     kinds = {b.get("kind") for b in bgs}
     need = {"cutout_on_brand_colour": lambda: kinds <= {"gradient"},
@@ -253,10 +487,37 @@ def _lint_semantics(plan, concept, hard_rules, assets_info) -> list[dict]:
                 probs.append(_p("urgency", path, f"{t.get('id')}.{field}: urgency wording is banned by the client rules"))
         if t.get("role") == "hook" and _hook_text(concept) and t.get("text") != _hook_text(concept):
             probs.append(_p("locked", path, "hook text must equal the concept's on-screen hook (human edits win)"))
-        if t.get("role") == "cta" and _cta_text(concept) and t.get("text") != _cta_text(concept):
-            probs.append(_p("locked", path, "CTA text must equal the concept's cta (human edits win)"))
-        if t.get("role") == "title" and concept.get("title") and t.get("text") != concept["title"]:
+        if t.get("role") == "cta":
+            lk = locked_cta(concept)
+            why = cta_issue(t.get("text") or "")
+            if lk and t.get("text") != lk:
+                probs.append(_p("locked", path, f"CTA text must equal the human-approved CTA {lk!r}"))
+            elif not lk and why:
+                probs.append(_p("cta_short", path, f"visible CTA {t.get('text')!r} is not a short CTA: {why}. "
+                                f"Use at most {CTA_MAX_WORDS} words, e.g. {derive_cta_short(concept)!r}"))
+            if t.get("cta_short") not in (None, t.get("text")):
+                probs.append(_p("cta_short", path, "cta_short must equal the cta block text"))
+        if t.get("role") == "title" and concept.get("title") and t.get("text") != clip_text(concept["title"]):
             probs.append(_p("locked", path, "title text must equal the concept title (human edits win)"))
+        if len(t.get("text") or "") > MAX_TEXT_CHARS:
+            probs.append(_p("text_len", path, f"{t.get('id')}: more than {MAX_TEXT_CHARS} characters"))
+        if t.get("keyword") and t["keyword"].lower() not in (t.get("text") or "").lower():
+            probs.append(_p("keyword", path, f"{t.get('id')}: highlight keyword {t['keyword']!r} is not in the text"))
+        if t.get("style") == "pill_headline" and t.get("region") == "top_center":
+            room = headline_room_px(plan)
+            if room is not None:
+                sz = int(_num(t.get("size"), 90))
+                need = headline_height_px(t.get("text") or "", sz, int((t.get("stroke") or [8])[0]))
+                if need > room:
+                    probs.append(_p("headline_room", path, f"{t.get('id')}: headline needs {need}px but only {room}px are free above "
+                                    f"the head (head top {int(_head_top(plan) * 1920)}px); shrink or shorten it"))
+        if t.get("role") == "callout" and t.get("region") in ("left_mid", "right_mid"):
+            best, ov = callout_side(plan)
+            if ov and ov[t["region"]] > 0.02:
+                other = "right_mid" if t["region"] == "left_mid" else "left_mid"
+                probs.append(_p("callout_head", path, f"{t.get('id')}: callout in {t['region']} overlaps the head "
+                                f"({ov[t['region']]:.2f} of frame width); use {best}",
+                                fixable=ov[other] <= 0.02, level="error" if ov[other] <= 0.02 else "warn"))
         fill, plate = t.get("fill"), t.get("plate")
         stroke = t.get("stroke")
         if _is_hex(fill):
@@ -288,6 +549,9 @@ def _lint_semantics(plan, concept, hard_rules, assets_info) -> list[dict]:
     cap = plan.get("captions") or {}
     if _num(cap.get("scrim")) < MIN_SCRIM - 1e-9:
         probs.append(_p("scrim", "captions/scrim", f"captions need a scrim >= {MIN_SCRIM} over saree/hands"))
+    if cap.get("source") == "plan":
+        for i, why in _chunk_problems(cap.get("chunks") or []):
+            probs.append(_p("chunk_size", f"captions/chunks/{i}", f"caption chunk {i}: {why}"))
     for i, c in enumerate(cap.get("chunks") or []):
         if _num(c.get("start")) < 0 or _num(c.get("end")) > dur + 1e-6 or _num(c.get("end")) <= _num(c.get("start")):
             probs.append(_p("timing", f"captions/chunks/{i}", "caption chunk outside 0..duration or empty"))
@@ -369,6 +633,8 @@ def _coerce(plan: dict) -> dict:
         bg.setdefault("src", None)
         bg.setdefault("prompt", None)
         ti = bg.get("transition_in")
+        if isinstance(ti, dict) and ti.get("type") == "dissolve":
+            ti["type"] = "fade"
         if not isinstance(ti, dict) or ti.get("type") not in ("cut", "fade", "slide_left", "slide_right"):
             bg["transition_in"] = {"type": "fade", "dur": 0.6}
         else:
@@ -380,6 +646,18 @@ def _coerce(plan: dict) -> dict:
             t.setdefault("pill_text", None)
             t.setdefault("plate", None)
             t.setdefault("stroke", None)
+            if t.get("animation") not in ANIMATIONS:
+                t["animation"] = "pop"
+            if t.get("font") not in ("devanagari", "latin"):
+                t["font"] = "latin"
+            if isinstance(t.get("text"), str) and len(t["text"]) > MAX_TEXT_CHARS:
+                t["text"] = clip_text(t["text"])
+            if t.get("weight") not in (None, "regular", "bold", "black"):
+                t["weight"] = "bold"
+            if t.get("point") not in (None, "shoulder", "margin", "none"):
+                t["point"] = "shoulder"
+            if not isinstance(t.get("keyword"), (str, type(None))):
+                t["keyword"] = None
             if isinstance(t.get("pill_text"), str):
                 t["pill_text"] = t["pill_text"][:18] or None
     cap = plan.get("captions")
@@ -392,6 +670,10 @@ def _coerce(plan: dict) -> dict:
     if isinstance(sh, dict):
         sh["shadow"] = _clamp(_num(sh.get("shadow"), 0.5), 0, 1)
     return plan
+
+
+ANIMATIONS = ("pop", "slide_left", "slide_right", "fade")
+BEAT_TRANSITIONS = ("cut", "dissolve", "push", "flash")
 
 
 def _infer_preset(plan: dict) -> str:
@@ -432,9 +714,35 @@ def repair_plan(plan: dict, problems: list[dict] | None = None, concept: dict | 
     sub = plan.get("subject") if isinstance(plan.get("subject"), dict) else {}
     want = [{"beat": i, "clip": b.get("clip"), "in": round(_num(b.get("src_in")), 3), "out": round(_num(b.get("src_out")), 3)}
             for i, b in enumerate(beats)]
-    if want and sub.get("segments") != want:
+    old = [x for x in (sub.get("segments") or []) if isinstance(x, dict)]
+    core = lambda xs: [{k: x.get(k) for k in ("beat", "clip", "in", "out")} for x in xs]  # noqa: E731
+    if want and core(old) != want:
         note("subject segments re-derived from concept beats")
-        sub["segments"] = want
+        old = []
+    if want:
+        head = _head(plan) or {}
+        per_clip = head.get("per_clip") if isinstance(head.get("per_clip"), dict) else {}
+        sizes = [float(v) for v in per_clip.values() if isinstance(v, (int, float)) and v > 0]
+        ref = statistics.median(sizes) if sizes else None
+        segs_out = []
+        for i, w in enumerate(want):
+            seg = dict(w)
+            prev = old[i] if i < len(old) else {}
+            sc = _num(prev.get("subject_scale"), 1.0)
+            hs = per_clip.get(w["clip"])
+            if ref and isinstance(hs, (int, float)) and hs > 0:
+                sc = ref / float(hs)  # equal head size across clips: no jump at the beat boundary
+            seg["subject_scale"] = round(_clamp(sc, 0.85, 1.15) if ref else _clamp(sc, 0.7, 1.3), 3)
+            if i > 0:
+                ti = prev.get("transition_in") if isinstance(prev.get("transition_in"), dict) else {}
+                ty = ti.get("type") if ti.get("type") in BEAT_TRANSITIONS else ("flash" if i == len(want) - 1 else "push")
+                dflt = 0.15 if ty == "flash" else 0.25
+                seg["transition_in"] = {"type": ty, "dur": round(_clamp(_num(ti.get("dur"), dflt), 0.1, 0.6), 2)}
+            segs_out.append(seg)
+        sub["segments"] = segs_out
+    rim = sub.get("rim") if isinstance(sub.get("rim"), dict) else {}
+    sub["rim"] = {"enabled": bool(rim.get("enabled", False)), "px": int(_clamp(_num(rim.get("px"), 2), 1, 6)),
+                  "color": rim.get("color") if _is_hex(rim.get("color")) else "#fff3e0"}
     sub.setdefault("mask", {"prompt": "woman", "feather": 2.0, "edge": [0.35, 0.65]})
     sub.setdefault("transform", {"scale": 1.0, "x": 0, "y": 0})
     sub.setdefault("shadow", 0.5)
@@ -481,6 +789,24 @@ def repair_plan(plan: dict, problems: list[dict] | None = None, concept: dict | 
             bg["id"] = f"bg{i + 1}x"
         seen.add(bg["id"])
     plan["background"] = bgs
+    if dur >= 6 and all(b["kind"] == "gradient" for b in bgs) and len(bgs) < 2:
+        c = bgs[0]["colors"]
+        mid = min((w[0] for w in wins[1:]), key=lambda x: abs(x - dur / 2), default=round(dur / 2, 2))
+        bgs.append({"id": "bg2", "kind": "gradient", "colors": [_mix_white(c[-1], 0.4), _mix_white(c[0], 0.2)], "src": None,
+                    "prompt": None, "blur": 0, "zoom": 1.08, "dim": 1.0, "start": round(_clamp(mid, 1.0, dur - 1.0), 2),
+                    "transition_in": {"type": "fade", "dur": 0.5}})
+        note("second background beat added (a lighter gradient) so the reel is not one flat colour")
+    sl = _subject_luma(plan)
+    grads = [b for b in bgs if b["kind"] == "gradient"]
+    if grads and max(_lum_contrast(_bg_luma(b), sl) for b in bgs) < MIN_BG_CONTRAST:
+        bg, k = grads[-1], 0
+        while _lum_contrast(_bg_luma(bg), sl) < MIN_BG_CONTRAST + 0.4 and k < 10:
+            bg["colors"] = [_mix_white(c, 0.15) for c in bg["colors"]]
+            k += 1
+        note(f"{bg['id']}: lightened for contrast against the subject")
+    if any(_bg_luma(b) < RIM_LUMA for b in bgs) and not (sub["rim"]["enabled"] and sub["rim"]["px"] >= 2):
+        sub["rim"].update(enabled=True, px=max(2, sub["rim"]["px"]))
+        note("subject rim light enabled (dark background)")
 
     # overlays
     known_pips = _asset_names(assets_info, "pips", people_ok=True)
@@ -516,12 +842,42 @@ def repair_plan(plan: dict, problems: list[dict] | None = None, concept: dict | 
         if t.get("role") == "hook" and hook and t.get("text") != hook:
             t["text"] = hook
             note(f"{t['id']}: hook restored from concept")
-        if t.get("role") == "cta" and cta and t.get("text") != cta:
-            t["text"] = cta
-            note(f"{t['id']}: cta restored from concept")
-        if t.get("role") == "title" and concept.get("title") and t.get("text") != concept["title"]:
-            t["text"] = concept["title"]
+        if t.get("role") == "cta":
+            lk = locked_cta(concept)
+            if lk and t.get("text") != lk:
+                t["text"] = lk
+                note(f"{t['id']}: cta restored from the human-approved CTA")
+            elif not lk and cta_issue(str(t.get("text") or "")):
+                t["text"] = cta or derive_cta_short(concept)
+                note(f"{t['id']}: cta replaced by a short CTA {t['text']!r}")
+        if t.get("role") == "title" and concept.get("title") and t.get("text") != clip_text(concept["title"]):
+            t["text"] = clip_text(concept["title"])
         t["text"] = str(t.get("text") or "")
+        if t.get("role") == "cta":
+            t["cta_short"] = t["text"]
+        else:
+            t.pop("cta_short", None)
+        if t.get("role") == "hook":
+            if not isinstance(t.get("stroke"), list) or _num(t["stroke"][0]) < 8:
+                t["stroke"] = [8, (t["stroke"][1] if isinstance(t.get("stroke"), list) and _is_hex(t["stroke"][1]) else "#2a0a1a")]
+            t["weight"] = "black"
+            if isinstance(t.get("keyword"), str):
+                t["keyword"] = t["keyword"].strip(".,!?;:'\" ")
+            if not t.get("keyword") or t["keyword"].lower() not in t["text"].lower():
+                ws = [w.strip(".,!?;:'\"") for w in t["text"].split()]
+                ws = [w for w in ws if len(w) >= 4] or ws
+                t["keyword"] = max(reversed(ws), key=len) if ws else None
+        elif t.get("keyword") and t["keyword"].lower() not in t["text"].lower():
+            t["keyword"] = None
+        if t.get("role") == "callout":
+            t["weight"] = t.get("weight") or "bold"
+            t["point"] = t.get("point") if t.get("point") in ("shoulder", "margin", "none") else "shoulder"
+            if t.get("region") in ("left_mid", "right_mid"):
+                best, ov = callout_side(plan)
+                if ov and ov[t["region"]] > 0.02 and ov[best] < ov[t["region"]]:
+                    note(f"{t['id']}: callout moved to {best}, away from the head")
+                    t["region"] = best
+                    t["rot"] = -abs(t["rot"]) if best == "left_mid" else abs(t["rot"])
         if t.get("role") == "hook" and "beat" not in t and wins:
             t["beat"] = 0
         if t.get("role") == "cta" and "beat" not in t and wins:
@@ -552,6 +908,14 @@ def repair_plan(plan: dict, problems: list[dict] | None = None, concept: dict | 
             else:
                 t["text"] = _short(t["text"], cap)
                 note(f"{t['id']}: text shortened to fit {t['region']}")
+        # headline stays above the head
+        if t.get("style") == "pill_headline" and t.get("region") == "top_center":
+            room = headline_room_px(plan)
+            stk = int((t.get("stroke") or [8])[0]) if isinstance(t.get("stroke"), list) else 8
+            if room is not None and headline_height_px(t["text"], t["size"], stk) > room:
+                new = _fit_size(t["text"], t["size"], room, stk)
+                note(f"{t['id']}: headline size {t['size']} -> {new} to stay above the head")
+                t["size"] = new
         # claims: drop non-locked blocks with price/urgency wording
         allowed = _concept_texts(concept).lower()
         for field in ("text", "pill_text"):
@@ -574,7 +938,11 @@ def repair_plan(plan: dict, problems: list[dict] | None = None, concept: dict | 
         stroke_ok = isinstance(stroke, list) and len(stroke) == 2 and _is_hex(stroke[1]) and stroke[0] >= 4 \
             and contrast(fill, stroke[1]) >= 4.5
         ref = [plate] if plate else bgcols
-        if not all(contrast(fill, c) >= 4.5 for c in ref) and not (stroke_ok and not plate):
+        if not all(contrast(fill, c) >= 4.5 for c in ref) and not (stroke_ok and not plate) \
+                and not plate and contrast(fill, "#2a0a1a") >= 4.5:
+            t["stroke"] = [8, "#2a0a1a"]
+            note(f"{t['id']}: dark 8 px stroke added for contrast")
+        elif not all(contrast(fill, c) >= 4.5 for c in ref) and not (stroke_ok and not plate):
             best = max(("#ffffff", "#111111"), key=lambda c: min(contrast(c, r) for r in ref))
             note(f"{t['id']}: fill {fill} -> {best} for contrast")
             t["fill"] = best
@@ -641,6 +1009,15 @@ def repair_plan(plan: dict, problems: list[dict] | None = None, concept: dict | 
         m = _PRICE.search(txt)
         if e - s > 0.05 and txt and not (m and m.group(0).lower() not in _concept_texts(concept).lower()):
             chunks.append({"text": txt[:60], "start": round(s, 2), "end": round(e, 2)})
+    if cap["source"] == "plan" and _chunk_problems(chunks):
+        re_cut = rechunk_captions(chunks)
+        if re_cut is None:
+            note("caption chunks cannot meet 3-6 words / 0.8-2.0 s: using speech-timed captions instead")
+            cap["source"], chunks = "asr", []
+        else:
+            note("caption chunks re-cut to 3-6 words / 0.8-2.0 s")
+            chunks = re_cut
+    cap["chunking"] = {"words": list(CAPTION_WORDS), "dur": list(CAPTION_SECS)}
     cap["chunks"] = [] if cap["source"] == "asr" else chunks
     plan["captions"] = cap
     plan["text"].sort(key=lambda t: t["start"])
@@ -671,18 +1048,20 @@ def _palette(brand_colours) -> list[str]:
 def _hook_block(concept, wins, plan=None) -> dict:
     s, e = wins[0]
     return {"id": "hook", "role": "hook", "text": _hook_text(concept), "region": "top_center", "font": "latin",
-            "size": 96, "style": "pill_headline", "fill": "#ffffff", "stroke": [6, "#2a0a1a"], "plate": None,
-            "pill_text": None, "rot": 0, "animation": "pop", "start": round(s + 0.2, 2), "end": round(min(e, s + 3.2), 2), "beat": 0}
+            "size": 96, "style": "pill_headline", "fill": "#ffffff", "stroke": [8, "#2a0a1a"], "plate": None,
+            "pill_text": None, "rot": 0, "animation": "pop", "weight": "black", "start": round(s + 0.2, 2), "end": round(min(e, s + 3.2), 2), "beat": 0}
 
 
 def _cta_block(concept, wins, plan=None) -> dict:
     s, e = wins[-1]
-    return {"id": "cta", "role": "cta", "text": _cta_text(concept), "region": "cta_top", "font": "latin", "size": 64,
+    return {"id": "cta", "role": "cta", "text": _cta_text(concept), "cta_short": _cta_text(concept), "region": "cta_top",
+            "font": "latin", "size": 64,
             "style": "cta_pill", "fill": "#111111", "stroke": None, "plate": "#fbbf24", "pill_text": None, "rot": 0,
             "animation": "slide_left", "start": round(max(s, e - 3.0), 2), "end": round(e, 2), "beat": len(wins) - 1}
 
 
-def default_plan(concept: dict, brand_colours: list[str] | None = None, *, look: str | None = None) -> dict:
+def default_plan(concept: dict, brand_colours: list[str] | None = None, *, look: str | None = None,
+                head: dict | None = None) -> dict:
     """Safe deterministic plan (always schema-valid and lint-clean for any concept with >= 1 beat >= 3 s)."""
     cols = _palette(brand_colours)
     c1 = _darken(cols[0], 0.7)
@@ -713,6 +1092,10 @@ def default_plan(concept: dict, brand_colours: list[str] | None = None, *, look:
     if wins and _cta_text(concept):
         plan["text"].append(_cta_block(concept, wins))
     plan["meta"] = {"source": "default"}
+    if isinstance(head, dict):
+        plan["meta"]["head"] = head
+    plan = repair_plan(plan, [], concept)  # second brand beat, rim light, beat transitions, headline fit, callout side
+    plan["meta"] = {k: v for k, v in plan["meta"].items() if k != "repaired"}
     return plan
 
 
@@ -771,8 +1154,10 @@ title: {title}
 beats (output window in brackets):
 {beats}
 human-approved on-screen hook (use verbatim, role "hook"): {hook!r}
-human-approved CTA (use verbatim, role "cta"): {cta!r}
+{cta_line}
 output duration: {dur}s
+{head_line}
+{palette_line}
 
 AVAILABLE ASSETS
 person-free backdrop stills (usable as kind image or blur_still, src = name): {backdrops}
@@ -785,6 +1170,8 @@ PRESETS (pick one; preset must match what you use)
 TEXT STYLES
 {styles}
 REGIONS and max characters: {regions}
+ENUM VALUES (use these literal strings and nothing else; any other value is rejected):
+{enums}
 
 RULES
 - background[0].start = 0; later backgrounds dissolve in (transition_in fade 0.4-0.8s) at their start. 1-3 backgrounds. Use plates only if the preset is cutout_on_textile_plate; dim plates to <= 0.6 and tint colors to the brand palette so the speaker separates from them.
@@ -793,6 +1180,11 @@ RULES
 - No prices, discounts, percentages, urgency or claims not in the concept/brief. pill_text is a neutral label like "STORY" or null.
 - Contrast: text fill must have contrast >= 4.5 against its plate (or the dimmed background); captions.scrim >= 0.4.
 - Add motion variety: different animations per block, background zoom 1.0-1.15.
+- The visible CTA is a SHORT separate line (at most 4 words, e.g. "Shop Maheshwari"), never an internal direction: no " - ", "card", "soft", "end". Set the cta block's cta_short to the same text. Every text is at most 80 characters.
+- Backgrounds: on cutout_on_brand_colour use at least 2 background beats (the second a clearly lighter mid-tone gradient, luminance 0.15-0.45, from about the middle, at a beat boundary; never near-white), never a still with people, and keep the background's luminance different from the saree so she separates. If a background is dark (luma < 0.2) set subject.rim.enabled true (px >= 2).
+- Hook: stroke width 8, weight "black", keyword = ONE word of the hook to highlight in yellow. The headline must fit above the speaker's head. A callout sits in the side margin (left_mid/right_mid) away from the head with point "shoulder", never over the face.
+- Between beats set segments[i].transition_in (i >= 1) to push (0.25s) or flash (0.15s) or dissolve; subject_scale 1.0 unless the head sizes differ.
+- Caption chunks (only if captions.source is "plan") are 3-6 words and 0.8-2.0 s each; normally keep source "asr".
 {look}{guidance}
 Return JSON matching this shape exactly (all keys shown are required):
 {shape}"""
@@ -800,18 +1192,51 @@ Return JSON matching this shape exactly (all keys shown are required):
 SHAPE = {
     "version": 1, "preset": "cutout_on_brand_colour", "size": [1080, 1920], "fps": 30, "duration": 14.1,
     "rationale": "one sentence why this look fits the brief",
-    "subject": {"segments": [{"beat": 0, "clip": "A.mov", "in": 1.0, "out": 4.0}],
+    "subject": {"segments": [{"beat": 0, "clip": "A.mov", "in": 1.0, "out": 4.0, "subject_scale": 1.0},
+                             {"beat": 1, "clip": "B.mov", "in": 2.0, "out": 5.0, "subject_scale": 1.0,
+                              "transition_in": {"type": "push", "dur": 0.25}}],
                 "mask": {"prompt": "woman", "feather": 2.0, "edge": [0.35, 0.65]},
-                "transform": {"scale": 1.0, "x": 0, "y": 0}, "shadow": 0.5},
+                "transform": {"scale": 1.0, "x": 0, "y": 0}, "shadow": 0.5,
+                "rim": {"enabled": True, "px": 2, "color": "#fff3e0"}},
     "background": [{"id": "bg1", "kind": "gradient", "colors": ["#3b0a2a", "#c2410c"], "src": None, "prompt": None,
-                    "blur": 0, "zoom": 1.08, "dim": 1.0, "start": 0, "transition_in": {"type": "cut", "dur": 0}}],
+                    "blur": 0, "zoom": 1.08, "dim": 1.0, "start": 0, "transition_in": {"type": "cut", "dur": 0}},
+                   {"id": "bg2", "kind": "gradient", "colors": ["#a3586f", "#d98a5f"], "src": None, "prompt": None,
+                    "blur": 0, "zoom": 1.08, "dim": 1.0, "start": 4.0, "transition_in": {"type": "fade", "dur": 0.5}}],
     "text": [{"id": "hook", "role": "hook", "text": "...", "region": "top_center", "font": "latin", "size": 96,
-              "style": "pill_headline", "fill": "#ffffff", "stroke": [6, "#2a0a1a"], "plate": None, "pill_text": "STORY",
-              "rot": 0, "animation": "pop", "start": 0.2, "end": 3.2, "beat": 0}],
+              "style": "pill_headline", "fill": "#ffffff", "stroke": [8, "#2a0a1a"], "plate": None, "pill_text": "STORY",
+              "rot": 0, "animation": "pop", "start": 0.2, "end": 3.2, "beat": 0, "weight": "black", "keyword": "one word of the text"},
+             {"id": "cta", "role": "cta", "text": "Shop Maheshwari", "cta_short": "Shop Maheshwari", "region": "cta_top",
+              "font": "latin", "size": 64, "style": "cta_pill", "fill": "#111111", "stroke": None, "plate": "#fbbf24",
+              "pill_text": None, "rot": 0, "animation": "slide_left", "start": 11.0, "end": 14.0, "beat": 3}],
     "captions": {"style": "pop_captions", "source": "asr", "chunks": [], "fill": "#ffffff", "highlight": "#fbbf24",
                  "stroke": [6, "#2a0a1a"], "scrim": 0.5},
     "overlays": [], "audio": {"source": "subject", "music": None},
 }
+
+
+def _enum_table() -> str:
+    """Every enum of the schema spelled out literally, so the model never invents a value (and never costs a retry)."""
+    P = SCHEMA["properties"]
+    ti = P["text"]["items"]["properties"]
+    seg = P["subject"]["properties"]["segments"]["items"]["properties"]
+    rows = {
+        "preset": P["preset"]["enum"],
+        "background[].kind": P["background"]["items"]["properties"]["kind"]["enum"],
+        "background[].transition_in.type": SCHEMA["$defs"]["transition"]["properties"]["type"]["enum"],
+        "subject.segments[].transition_in.type": seg["transition_in"]["properties"]["type"]["enum"],
+        "text[].role": ti["role"]["enum"],
+        "text[].region": ti["region"]["enum"],
+        "text[].font": ti["font"]["enum"],
+        "text[].style": ti["style"]["enum"],
+        "text[].animation": ti["animation"]["enum"],
+        "text[].weight": ti["weight"]["enum"],
+        "text[].point": ti["point"]["enum"],
+        "captions.source": P["captions"]["properties"]["source"]["enum"],
+        "overlays[].region": P["overlays"]["items"]["properties"]["region"]["enum"],
+        "overlays[].animation": P["overlays"]["items"]["properties"]["animation"]["enum"],
+        "fps": P["fps"]["enum"],
+    }
+    return "\n".join(f"- {k}: " + " | ".join(json.dumps(v) for v in vals) for k, vals in rows.items())
 
 
 def _assets_block(assets_info: dict | None, key: str) -> str:
@@ -822,7 +1247,16 @@ def _assets_block(assets_info: dict | None, key: str) -> str:
                      (" [CONTAINS PEOPLE, not allowed as background]" if a.get("has_people") else "") for a in items)
 
 
-def _build_prompt(concept, brief, memory_text, assets_info, guidance, look, errors) -> str:
+def _palette_line(brand_colours) -> str:
+    cols = [c for c in (brand_colours or []) if _is_hex(c)]
+    if cols:
+        return (f"BRAND PALETTE: {', '.join(cols)}. Build gradients from these; the colours in the JSON shape below are "
+                "examples only, do not copy them.")
+    return ("BRAND PALETTE: not given; pick 2-3 rich colours that suit the garment and the brief. The colours in the JSON "
+            "shape below are examples only, do not copy them.")
+
+
+def _build_prompt(concept, brief, memory_text, assets_info, guidance, look, errors, head=None, brand_colours=None) -> str:
     wins = beat_windows(concept)
     beats = "\n".join(
         f"  {i} [{w[0]:.1f}-{w[1]:.1f}s] clip={b.get('clip')} src {b.get('src_in')}-{b.get('src_out')} "
@@ -836,7 +1270,8 @@ def _build_prompt(concept, brief, memory_text, assets_info, guidance, look, erro
     shape = json.dumps(SHAPE, ensure_ascii=False)
     p = PROMPT.format(
         brief=brief.strip(), memory=memory_text.strip() or "(none)", title=concept.get("title", ""), beats=beats,
-        hook=_hook_text(concept), cta=_cta_text(concept), dur=total_duration(concept),
+        hook=_hook_text(concept), cta_line=_cta_line(concept), head_line=_head_line(head), palette_line=_palette_line(brand_colours), dur=total_duration(concept),
+        enums=_enum_table(),
         backdrops=_assets_block(assets_info, "backdrops"), pips=_assets_block(assets_info, "pips"),
         presets="\n".join(f"- {k}: {v}" for k, v in PRESETS.items()),
         styles="\n".join(f"- {k}: {v}" for k, v in TEXT_STYLES.items()),
@@ -845,6 +1280,29 @@ def _build_prompt(concept, brief, memory_text, assets_info, guidance, look, erro
         p += "\n\nYOUR LAST PLAN FAILED THESE CHECKS. Fix every one and return the full corrected JSON:\n" + \
              "\n".join(f"- {e}" for e in errors)
     return p
+
+
+def _cta_line(concept: dict) -> str:
+    lk = locked_cta(concept)
+    if lk:
+        return f'human-approved visible CTA (use verbatim as the cta block text and cta_short, role "cta"): {lk!r}'
+    if not _cta_text(concept):
+        return "no CTA"
+    raw = (concept.get("cta") or "").strip()
+    note = f" (an internal direction, NEVER show it: {raw!r})" if raw else ""
+    return (f'CTA: write a SHORT visible CTA of at most 4 words as the cta block text and cta_short, '
+            f'e.g. {derive_cta_short(concept)!r}{note}')
+
+
+def _head_line(head: dict | None) -> str:
+    if not isinstance(head, dict):
+        return ""
+    top = head.get("top_frac") if isinstance(head.get("top_frac"), (int, float)) else DEFAULT_HEAD_TOP
+    room = int(top * 1920) - HEADLINE_TOP_PX - HEADLINE_GAP_PX
+    bb = head.get("bbox_frac")
+    side = f"; the speaker box is {[round(float(v), 2) for v in bb]} of the frame" if isinstance(bb, (list, tuple)) and len(bb) == 4 else ""
+    return (f"SPEAKER GEOMETRY: her head top is at {int(top * 1920)} px of 1920, so the headline has about {room} px of height "
+            f"(shrink size or shorten words to fit; 2 lines at size 96 need ~230 px){side}.")
 
 
 def _look_preset(look) -> str | None:
@@ -857,7 +1315,7 @@ def _look_preset(look) -> str | None:
 
 def plan_composition(run, concept: dict, brief: str, memory_text: str, assets_info: dict | None, *,
                      guidance: str = "", look=None, retries: int = 2, brand_colours: list[str] | None = None,
-                     spark=None) -> dict:
+                     spark=None, head: dict | None = None) -> dict:
     """Muse Spark writes the plan; code lints + repairs; up to `retries` re-asks with the remaining errors; falls
     back to default_plan so a run never blocks. The returned plan is always schema-valid and lint-clean, with
     plan['meta'] = {source: 'spark'|'default', attempts, repaired, spark_errors, tokens}."""
@@ -869,7 +1327,7 @@ def plan_composition(run, concept: dict, brief: str, memory_text: str, assets_in
     tokens = 0
     for attempt in range(1 + retries):
         t0 = time.time()
-        prompt = _build_prompt(concept, brief, memory_text, assets_info, guidance, look, errors)
+        prompt = _build_prompt(concept, brief, memory_text, assets_info, guidance, look, errors, head, brand_colours)
         try:
             raw, usage = spark(SYSTEM, prompt, effort="low", max_out=8000)
             tokens += int((usage or {}).get("tokens") or 0)
@@ -885,6 +1343,8 @@ def plan_composition(run, concept: dict, brief: str, memory_text: str, assets_in
             history.append(errors[0])
             _trace(run, "muse-spark", {"attempt": attempt + 1}, {"error": errors[0]}, t0, "error", errors[0])
             continue
+        if isinstance(head, dict):
+            raw["meta"] = dict(raw.get("meta") if isinstance(raw.get("meta"), dict) else {}, head=head)
         problems_raw = lint_plan(_coerce(copy.deepcopy(raw)) if isinstance(raw, dict) else raw, concept, rules,
                                  assets_info=assets_info) if isinstance(raw, dict) else []
         plan = repair_plan(raw, problems_raw, concept, assets_info=assets_info)
@@ -902,7 +1362,7 @@ def plan_composition(run, concept: dict, brief: str, memory_text: str, assets_in
         errors = [f"{p['path']}: {p['msg']}" for p in left][:12]
         _trace(run, "muse-spark", {"attempt": attempt + 1}, {"errors": errors}, t0, "error",
                f"composition plan attempt {attempt + 1} had {len(left)} unfixable problems, retrying")
-    plan = default_plan(concept, brand_colours, look=want)
+    plan = default_plan(concept, brand_colours, look=want, head=head)
     plan = repair_plan(plan, [], concept, assets_info=assets_info)
     plan["meta"] = dict(plan.get("meta") or {}, source="default", attempts=1 + retries, spark_errors=history[-12:], tokens=tokens)
     _trace(run, "composition-default", {"reason": errors[:3]}, plan, time.time(), "ok",

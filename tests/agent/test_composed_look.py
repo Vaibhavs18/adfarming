@@ -31,9 +31,9 @@ def png(path, size=(8, 8), colour=(120, 40, 60)):
 class ComposedMedia(FakeMedia):
     """FakeMedia plus fake composition backends. Records every call so tests can assert what was (not) paid for."""
 
-    def __init__(self, textile=True, hook_override=None, **kw):
+    def __init__(self, textile=True, hook_override=None, callout=False, **kw):
         super().__init__(**kw)
-        self.textile, self.hook_override = textile, hook_override
+        self.textile, self.hook_override, self.callout = textile, hook_override, callout
         self.plan_calls, self.plates, self.stills, self.mattes = [], 0, 0, 0
         self.renders, self.previews, self.derived = [], [], []
         self.fail = set()      # {"matte_still", "matte_video", "render", "plate"}
@@ -45,10 +45,23 @@ class ComposedMedia(FakeMedia):
                        grab_frame=self.grab, still_video=self.still_video, derive_ratio=self.derive)
         return b
 
+    cta = None
+
+    def generate(self, run, brief, clips, refs, attempts=3, guidance=""):
+        cs = super().generate(run, brief, clips, refs, attempts, guidance)
+        if self.cta:
+            for c in cs:
+                c["cta"] = self.cta
+        return cs
+
     def plan(self, run, concept, brief, memory_text, assets_info, guidance="", look=None, **kw):
         self.plan_calls.append({"guidance": guidance, "look": look, "hook": concept["beats"][0]["on_screen_text"]})
         run.trace("muse-spark", {}, {}, decision="fake plan")
         p = compose_plan.default_plan(concept, look="cutout_on_textile_plate" if self.textile else look)
+        if self.callout:
+            p["text"].append({"id": "callout", "role": "callout", "text": "Pure cotton", "region": "right_mid", "font": "latin",
+                              "size": 40, "style": "callout_tag", "fill": "#111111", "stroke": None, "plate": "#fbbf24",
+                              "pill_text": None, "rot": -4, "animation": "pop", "start": 6.5, "end": 8.5, "beat": 1})
         if self.hook_override:
             for t in p["text"]:
                 if t["role"] == "hook":
@@ -73,7 +86,8 @@ class ComposedMedia(FakeMedia):
         if "matte_still" in self.fail:
             return {"error": "no match", "matte": None, "cost_usd": 0.0}
         png(out_png)
-        return {"matte": str(out_png), "cost_usd": 0.0025, "head_top_frac": 0.2}
+        return {"matte": str(out_png), "cost_usd": 0.0025, "head_top_frac": 0.2,
+                "subject_bbox_frac": [0.2, 0.18, 0.8, 1.0]}
 
     def still_video(self, frames, out_path, fps=5):
         Path(out_path).write_bytes(b"v")
@@ -86,9 +100,18 @@ class ComposedMedia(FakeMedia):
             return {"error": "no match", "matte": None, "cost_usd": 0.0}
         Path(out_path).write_bytes(b"matte")
         run.trace("sam-3.1-matte", {}, {}, cost_usd=0.051)
-        return {"matte": str(out_path), "cost_usd": 0.051, "head_top_frac": 0.2, "frames": 100}
+        return {"matte": str(out_path), "cost_usd": 0.051, "head_top_frac": 0.2, "frames": 100,
+                "subject_bbox_frac": [0.2, 0.18, 0.8, 1.0]}
 
-    def render(self, plan, assets, out_path, preview=False, workdir=None):
+    def render(self, plan, assets, out_path, preview=False, workdir=None, size=None):
+        if size is not None:
+            self.derived.append((size, plan))
+            if "ratio" in self.fail:
+                raise RuntimeError("1:1 layout exploded")
+            if "ratio_unsupported" in self.fail:
+                return {"unsupported": True, "reason": "no 16:9 layout"}
+            Path(out_path).write_bytes(b"composed-" + f"{size[0]}x{size[1]}".encode())
+            return {"out": str(out_path)}
         if "render" in self.fail:
             raise RuntimeError("ffmpeg exploded")
         if preview:
@@ -187,7 +210,8 @@ def test_happy_path_cards_costs_and_audit(env):
     out = env / "out" / run
     assert (out / "c2_9x16.mp4").read_bytes() == b"composed-video"
     assert (out / "c2_simple_9x16.mp4").is_file() and json.loads((out / "meta.json").read_text())["look"] == "composed"
-    assert media.derived == [("1x1", 0), ("16x9", 0)] or [d[0] for d in media.derived] == ["1x1", "16x9"]
+    assert [d[0] for d in media.derived] == [(1080, 1080), (1920, 1080)]          # one render per ratio
+    assert (out / "c2_1x1.mp4").read_bytes() == b"composed-1080x1080" and edit["look"].get("ratios") in (None, {"9x16": "composed", "1x1": "composed", "16x9": "composed"})
     # the render got the speech-timed captions and the CTA hold
     plan = media.renders[0]
     assert plan["captions"]["chunks"] == [{"text": "namaste", "start": 0.0, "end": 1.5}]
@@ -279,7 +303,7 @@ def test_steer_not_applied_is_refused_then_applied():
 def test_human_headline_edit_is_locked_and_survives_replan():
     run, loop, client, media = _preview_loop([[("plan_composition", {"guidance": "bigger headline"})],
                                               [("preview_composition", {})], [("preview_composition", {})],
-                                              [("ask_human", {"summary": "ok"})]], hook_override="MODEL HOOK")
+                                              [("ask_human", {"summary": "ok"})]], hook_override="MODEL HOOK", callout=True)
     human(run, "edit", fields={"headline": "Meri apni hook", "callout": "Handloom"})
     r = loop.advance(run)                                        # consume_answer applies the edit by code
     assert r["status"] == "awaiting_human"
@@ -529,7 +553,8 @@ def test_retime_plan_adds_hold_captions_and_keeps_locked_text():
     out = ctools.retime_plan(p, c, [{"text": "namaste", "start": 0.0, "end": 1.5}, {"text": "", "start": 2, "end": 3}])
     assert out["duration"] == 14.0 and out["captions"]["chunks"] == [{"text": "namaste", "start": 0.0, "end": 1.5}]
     cta = next(t for t in out["text"] if t["role"] == "cta")
-    assert cta["end"] == 14.0 and cta["text"] == c["cta"]
+    assert cta["end"] == 14.0 and cta["text"] == cta["cta_short"] and not ctools.cta_is_internal(cta["text"])
+    assert len(cta["text"].split()) <= 4
     assert next(t for t in out["text"] if t["role"] == "hook")["text"] == "Hook one"
 
 
@@ -626,3 +651,250 @@ def test_render_without_a_master_is_refused_with_a_hint():
     (tb.dir / "work" / "master_hold.mp4").unlink()
     r = tb.call("render_composition", {})
     assert not r.ok and r.error["code"] == "missing_artifact" and "build_cuts" in r.error["hint"]
+
+
+# ------------------------------------------------------------------ F4: defects found by the reviews
+DIRTY_CTA = "See this Maheshwari on our website - soft end card"
+
+
+def _edit_loop(media, extra=()):
+    run = new_run()
+    loop, client, _ = loop_for(script("brief", "ideas", "preview", "edit") + list(extra), media)
+    loop.advance(run)
+    for kind, payload in [("approve", {}), ("approve", {"choice": "c2"}), ("approve", {}), ("approve", {})]:
+        human(run, kind, **payload)
+        loop.advance(run)
+    return run, loop
+
+
+@pytest.mark.parametrize("raw,ok", [
+    (DIRTY_CTA, "Shop Maheshwari"),
+    ("Shop Maheshwari now", "Shop Maheshwari now"),
+    ("Soft end card", "Shop now"),
+    ("Order today on our website for free delivery - fade", "Order today on our"),
+    ("", "Shop now"),
+])
+def test_short_cta_never_carries_an_internal_direction(raw, ok):
+    out = ctools.short_cta(raw)
+    assert out == ok and len(out.split()) <= 4 and not ctools.cta_is_internal(out)
+
+
+def test_internal_cta_direction_never_reaches_the_renderer_or_the_stills():
+    media = ComposedMedia(textile=False)
+    media.cta = DIRTY_CTA
+    run, loop = _edit_loop(media)
+    for plan in media.previews + media.renders:
+        cta = next(t for t in plan["text"] if t["role"] == "cta")
+        assert cta["text"] == cta["cta_short"] and not ctools.cta_is_internal(cta["text"]) and len(cta["text"].split()) <= 4
+        assert "soft" not in json.dumps(plan["text"]).lower()
+    assert media.renders and media.previews
+
+
+def test_human_cta_edit_is_kept_verbatim_and_shown():
+    media = ComposedMedia(textile=False)
+    media.cta = DIRTY_CTA
+    run, loop, client, media = _preview_loop([[("preview_composition", {})], [("ask_human", {"summary": "ok"})]],
+                                             textile=False)
+    media.cta = DIRTY_CTA
+    human(run, "edit", fields={"cta": "Visit dharaa dot com today"})
+    loop.advance(run)
+    tb = Toolbox(run, media.backends())
+    cta = next(t for t in tb.plan_rec()["plan"]["text"] if t["role"] == "cta")
+    assert cta["text"] == cta["cta_short"] == "Visit dharaa dot com today"
+    assert next(t for t in media.previews[-1]["text"] if t["role"] == "cta")["text"] == "Visit dharaa dot com today"
+
+
+def test_overlong_human_fields_are_ignored_with_a_reason_and_not_locked():
+    run, loop, client, media = _preview_loop([[("preview_composition", {})], [("ask_human", {"summary": "ok"})]])
+    long = "x" * 81
+    human(run, "edit", fields={"hook": long, "cta": "Shop now", "title": long, "callout": long})
+    loop.advance(run)
+    tb = Toolbox(run, media.backends())
+    ans = tb.last_answer()
+    assert ans["applied"] == ["cta"]
+    assert sum("too long" in i and "maximum is 80" in i for i in ans["ignored"]) == 3
+    locks = tb._read("human_locks.json")["c2"]
+    assert "hook" not in locks and "title" not in locks and locks["cta"] == "Shop now"
+    assert "callout" not in tb.plan_locks()
+    ok = "y" * 80
+    rejected = tb._lock_fields("c2", {"hook": ok, "title": long})
+    assert list(rejected) == ["title"] and "too long" in rejected["title"]
+    assert tb._read("human_locks.json")["c2"]["hook"] == ok
+
+
+def test_callout_and_preset_edits_are_reported_applied_only_when_applied():
+    run, loop, client, media = _preview_loop([[("preview_composition", {})], [("ask_human", {"summary": "ok"})]],
+                                             textile=False)           # default plan: no callout block
+    human(run, "edit", fields={"callout": "Handloom", "preset": "cutout_on_textile_plate"})
+    loop.advance(run)
+    tb = Toolbox(run, media.backends())
+    ans = tb.last_answer()
+    assert "callout" not in ans["applied"] and any(i.startswith("callout (") for i in ans["ignored"])
+    assert "callout" not in tb.plan_locks()
+    assert ("preset" in ans["applied"]) == (tb.plan_rec()["plan"]["preset"] == "cutout_on_textile_plate")
+    # with a callout block in the plan the same edit is applied
+    run2, loop2, _, media2 = _preview_loop([[("preview_composition", {})], [("ask_human", {"summary": "ok"})]],
+                                           textile=False, callout=True)
+    human(run2, "edit", fields={"callout": "Handloom"})
+    loop2.advance(run2)
+    tb2 = Toolbox(run2, media2.backends())
+    assert "callout" in tb2.last_answer()["applied"] and tb2.plan_locks()["callout"] == "Handloom"
+    assert next(t for t in tb2.plan_rec()["plan"]["text"] if t["role"] == "callout")["text"] == "Handloom"
+
+
+def test_head_box_from_the_matte_is_on_the_plan_before_preview_and_render():
+    media = ComposedMedia(textile=False)
+    run, loop = _edit_loop(media)
+    for plan in media.previews + media.renders:
+        head = plan["meta"]["head"]
+        assert head["top_frac"] == pytest.approx(0.2) and head["bbox_frac"] == pytest.approx([0.2, 0.18, 0.8, 1.0])
+
+
+def test_preview_time_uses_best_preview_time_else_the_headline_window(monkeypatch):
+    from adfarming import compose
+    c = concept()
+    p0 = compose_plan.default_plan(c)
+    h0 = next(t for t in p0["text"] if t["role"] == "hook")
+    real = ctools.preview_time(p0, 0, 0.0, 6.0)               # the renderer's own choice when it has one
+    assert h0["start"] <= real < h0["end"] and real == compose.best_preview_time(p0, 0.0, 6.0)
+    monkeypatch.delattr(compose, "best_preview_time")           # renderer without it: headline window midpoint
+    c = concept()
+    p = compose_plan.default_plan(c)
+    hook = next(t for t in p["text"] if t["role"] == "hook")
+    s, e = 0.0, 6.0
+    want = round((max(hook["start"], s) + min(hook["end"], e)) / 2, 3)
+    assert ctools.preview_time(p, 0, s, e) == want and hook["start"] <= want <= hook["end"]
+    monkeypatch.setattr(compose, "best_preview_time", lambda plan, a, b: 4.25, raising=False)
+    assert ctools.preview_time(p, 0, s, e) == 4.25
+    monkeypatch.setattr(compose, "best_preview_time", lambda plan, a, b: 99.0, raising=False)
+    assert ctools.preview_time(p, 0, s, e) < e                     # always inside the beat
+
+
+def test_preview_stills_are_cut_at_the_headline_time():
+    media = ComposedMedia(textile=False)
+    run, loop, client, _ = _preview_loop([], textile=False)
+    tb = Toolbox(run, media.backends())
+    plan = tb.plan_rec()["plan"]
+    hook = next(t for t in plan["text"] if t["role"] == "hook")
+    s, e = ctools.bg_ranges(plan)[0]
+    assert hook["start"] <= ctools.preview_time(plan, 0, s, e) < hook["end"]
+
+
+def test_simple_fallback_copies_are_refreshed_when_beats_change():
+    media = ComposedMedia()
+    run, loop = _edit_loop(media)
+    tb = Toolbox(run, media.backends())
+    first = (tb.dir / "c2_simple_9x16.mp4").read_bytes()
+    assert first.startswith(b"video")
+    # a content change: build_cuts makes new simple cuts (different bytes), then render again
+    tb.call("build_cuts", {})
+    tb.call("render_composition", {})
+    second = (tb.dir / "c2_simple_9x16.mp4").read_bytes()
+    assert second.startswith(b"video") and second != first
+    meta = tb._read("meta.json")
+    assert meta["simple_sig"] == meta["beats_sig"]
+
+
+def test_fallback_event_and_result_carry_no_absolute_paths():
+    media = ComposedMedia()
+    media.fail.add("render")
+    b = media.backends()
+
+    def boom(*a, **k):
+        raise RuntimeError("ffmpeg failed on /Users/secret/work/private/clip.mp4: bad")
+    b._over["render"] = boom
+    run = new_run()
+    loop = AgentLoop(client=FakeWonder(script("brief", "ideas", "preview", "edit")), backends=b)
+    loop.advance(run)
+    for kind, payload in [("approve", {}), ("approve", {"choice": "c2"}), ("approve", {})]:
+        human(run, kind, **payload)
+        loop.advance(run)
+    for e in kinds(run, "fallback"):
+        assert "/Users" not in json.dumps(e["payload"]) and "secret" not in json.dumps(e["payload"])
+    tb = Toolbox(run, b)
+    assert "/Users" not in json.dumps(tb._read("look.json")) and "clip.mp4" in json.dumps(tb._read("look.json"))
+    assert ctools.clean_detail("see /tmp/a/b/c.png and a/b") == "see c.png and a/b"
+
+
+def test_each_ratio_is_rendered_with_its_own_size_and_a_bad_ratio_keeps_the_simple_cut():
+    media = ComposedMedia(textile=False)
+    media.fail.add("ratio")
+    run, loop = _edit_loop(media)
+    tb = Toolbox(run, media.backends())
+    meta = tb._read("meta.json")
+    assert meta["ratios"] == {"9x16": "composed", "1x1": "simple", "16x9": "simple"}
+    assert (tb.dir / "c2_1x1.mp4").read_bytes().startswith(b"video") and meta["look"] == "composed"
+    assert not list(tb.dir.glob(".*.part.mp4"))
+    media2 = ComposedMedia(textile=False)
+    media2.fail.add("ratio_unsupported")
+    run2, _ = _edit_loop(media2)
+    assert Toolbox(run2, media2.backends())._read("meta.json")["ratios"]["16x9"] == "simple"
+
+
+def test_json_writes_are_atomic_and_leave_no_temp_files():
+    run, loop, client, media = _preview_loop([])
+    tb = Toolbox(run, media.backends())
+    tb._write("look.json", {"mode": "simple"})
+    assert tb._read("look.json") == {"mode": "simple"} and not list(tb.dir.glob(".*.tmp"))
+
+
+def test_preview_edit_in_the_simple_look_makes_no_plan(monkeypatch):
+    monkeypatch.setenv("STUDIO_LOOK", "simple")
+    run = new_run()
+    media = ComposedMedia()
+    loop = AgentLoop(client=FakeWonder(script("brief", "ideas") + [[("storyboard", {})], [("ask_human", {"summary": "f"})]]),
+                     backends=media.backends())
+    to_preview(run, loop)
+    human(run, "edit", fields={"hook": "Mera hook", "callout": "x", "preset": "cutout_on_brand_colour"})
+    tb = Toolbox(run, media.backends())
+    ans = tb._apply_edit("preview", {"fields": {"hook": "Mera hook", "callout": "x"}}, events.rebuild_run_state(run))
+    assert "callout" in ans["ignored"] and "hook" in ans["applied"] and tb.plan_rec() is None
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_real_preview_renderer_gets_the_subject_from_held_still_master_and_matte(tmp_path):
+    """Regression for the black preview stills: the preview master/matte are 5 fps held-still videos (first pts 0.1);
+    the REAL renderer must put the cut-out subject on screen at the time the headline is visible."""
+    from adfarming import compose
+    c = concept()
+    plan = compose_plan.default_plan(c, ["#3b0a2a", "#7a1d3c"])
+    ranges = ctools.bg_ranges(plan)
+    master_frames, matte_frames = [], []
+    for i, (s, e) in enumerate(ranges):
+        f = tmp_path / f"f{i}.png"
+        Image.new("RGB", (1080, 1920), (0, 230, 0)).save(f)          # the 'speaker' is bright green
+        m = Image.new("L", (1080, 1920), 0)
+        ImageDraw.Draw(m).ellipse([240, 500, 840, 1920], fill=255)
+        mp = tmp_path / f"m{i}.png"
+        m.save(mp)
+        master_frames.append((str(f), e - s))
+        matte_frames.append((str(mp), e - s))
+    master = ctools.d_still_video(master_frames, tmp_path / "prev_master.mp4")
+    matte = ctools.d_still_video(matte_frames, tmp_path / "prev_matte.mp4")
+    plan = ctools.set_head(plan, [{"head_top_frac": 0.29, "subject_bbox_frac": [0.22, 0.26, 0.78, 1.0]}])
+    out = compose.render_composition(ctools.render_view(plan), {"master": master, "matte": matte, "backdrops": {},
+                                                                "pip_images": {}, "clips": {}},
+                                     tmp_path / "stills", preview=True, workdir=tmp_path / "work")
+    assert out["frames"]
+    for p in out["frames"]:
+        im = Image.open(p).convert("RGB")
+        px = im.getpixel((im.width // 2, int(im.height * 0.72)))      # inside the ellipse, below the head
+        assert sum(px) > 120 and px[1] > px[0] + 40, (p, px)           # the speaker's pixels, not black / background
+    # the still time is where the headline is on screen
+    hook = next(t for t in plan["text"] if t["role"] == "hook")
+    s, e = ranges[0]
+    t_head = ctools.preview_time(plan, 0, s, e)
+    assert hook["start"] <= t_head < hook["end"]
+    # the seek into the held-still master must give the subject at ANY time (headline time, t=7.5 and mid-beat),
+    # not only at lucky multiples of the beat length
+    for t in (t_head, 1.7, 2.5, 7.5, 9.0):
+        sp = tmp_path / f"subj_{t}.png"
+        compose._subject_png(master, matte, t, compose_plan_with_size(plan), sp)
+        px = Image.open(sp).convert("RGBA").getpixel((540, 1400))
+        assert px[3] > 200 and sum(px[:3]) > 120 and px[1] > px[0] + 40, (t, px)
+
+
+def compose_plan_with_size(plan):
+    p = json.loads(json.dumps(plan))
+    p["size"], p["fps"] = [1080, 1920], 30          # what render_composition sets before it builds the subject chain
+    return p

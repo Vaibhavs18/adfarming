@@ -134,3 +134,125 @@ def test_render_deterministic_and_audio_copied(assets, tmp_path):
                           capture_output=True, text=True).stdout
     assert "h264,video,270,480" in info and "aac,audio" in info
     assert {x["kind"] for x in r["layers"]} == {"scrim", "caption", "text", "overlay"} and r["seconds"] > 0
+
+
+# ---------- F1 fixes: pixels, head-aware layout, ratios, hardening ----------
+def _held_assets(d, secs=9):
+    """5 fps held-still master/matte whose first frame sits at pts 0.1 (the real-run shape that gave black stills)."""
+    # built like agent d_still_video: looped stills held at 5 fps and concatenated (first pts offset, sparse frames)
+    for nm, col in (("a", "0x2060c0"), ("b", "0x2060c0")):
+        Image.new("RGB", (270, 480), (32, 96, 192)).save(d / f"s{nm}.png")
+    m = Image.new("L", (270, 480), 0)
+    ImageDraw.Draw(m).ellipse([40, 100, 230, 480], fill=255)
+    m.save(d / "hmat.png")
+    Image.new("L", (270, 480), 0).save(d / "blank.png")
+    for out, img in (("hm.mp4", "sa.png"), ("hmatte.mp4", "hmat.png")):
+        ff("-loop", "1", "-framerate", "5", "-t", str(secs / 2), "-i", str(d / img), "-loop", "1", "-framerate", "5", "-t", str(secs / 2 + 0.3), "-i", str(d / img),
+           "-filter_complex", "[0:v]scale=270:480,format=yuv420p,setsar=1[a];[1:v]scale=270:480,format=yuv420p,setsar=1[b];[a][b]concat=n=2:v=1:a=0,setpts=PTS+0.1/TB[o]",
+           "-map", "[o]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "5", str(d / out))
+    return {"master": str(d / "hm.mp4"), "matte": str(d / "hmatte.mp4"), "backdrops": {}, "pip_images": {}}
+
+
+def test_preview_subject_pixels_on_held_still_master(tmp_path):
+    a = _held_assets(tmp_path)
+    p = make_plan()
+    p["duration"] = 9
+    p["subject"]["segments"][0]["out"] = 9
+    p["background"] = p["background"][:1]
+    p["text"] = [{**p["text"][0], "start": 6.5, "end": 8.5, "plate": None, "stroke": None}]
+    p["captions"]["chunks"] = []
+    p["overlays"] = []
+    p["captions"]["scrim"] = 0.5
+    t = compose.best_preview_time(p, 0)
+    assert 6.5 <= t <= 8.5                       # the headline is on screen at the preview time
+    r = compose.render_composition(p, a, tmp_path / "pv", preview=True)
+    im = Image.open(r["frames"][0]).convert("RGB")
+    cx = im.getpixel((270, 700))                 # inside the ellipse, below the headline
+    assert cx[2] > 120 and cx[2] > cx[0] + 40    # the blue subject, not black / bare background
+    p2 = copy.deepcopy(p)
+    subj = tmp_path / "s.png"
+    compose._subject_png(a["master"], a["matte"], 7.5, p2, subj)
+    assert Image.open(subj).convert("RGBA").getpixel((540, 1400))[3] > 200
+
+
+def test_head_aware_text_and_callout():
+    lay = ct.get_layout("9x16")
+    head = (300.0, 520.0, 780.0, 940.0)
+    hook = {"text": "Beginner thi, phir bhi comfortable", "region": "top_center", "style": "pill_headline", "size": 96,
+            "plate": None, "stroke": [6, "#2a0a1a"], "pill_text": "STORY", "keyword": "comfortable"}
+    img, c, info = ct.render_block(hook, lay, head)
+    assert info["box"][3] <= head[1] - ct.HEAD_GAP + 2 and info["box"][1] >= 230
+    assert info["hl"] is not None and info["lines"][-1].split()[-1] == "comfortable"
+    tag = {"text": "Perfect for festive", "region": "right_mid", "style": "callout_tag", "plate": "#fbbf24", "fill": "#2a0a1a", "stroke": None, "size": 64}
+    for h in (head, (150.0, 520.0, 630.0, 940.0)):
+        _, _, ci = ct.render_block(tag, lay, h)
+        b = ci["box"]
+        assert not (b[0] < h[2] and b[2] > h[0] and b[1] < h[3] and b[3] > h[1])
+        assert ci["tail"] in ("down_left", "down_right") and ci["box"][1] >= h[3] - 1 or ci["box"][3] <= 1574
+    # cta shows the short field, never the internal direction
+    _, _, k = ct.render_block({"text": "See this on our website - soft end card", "cta_short": "Shop Maheshwari", "region": "cta_top",
+                               "style": "cta_pill", "plate": "#e11d48"}, lay, None)
+    assert k["lines"] == ["Shop Maheshwari"]
+
+
+def test_caption_baseline_and_soft_scrim():
+    lay = ct.get_layout("9x16")
+    box = tuple(lay.cap_box)
+    st = {**ct.ROLE_STYLE["caption"], "stroke": [9, "#1a0a14"]}
+    i1, c1, _ = ct.render_caption("nahi aata", st, box, None, lay)
+    i2, c2, _ = ct.render_caption("mere liye perfect saree ab", st, box, None, lay)
+    assert round(c1[1] + i1.height / 2) == round(c2[1] + i2.height / 2)      # same bottom edge: no jumping
+    img, _ = ct.render_scrim(box, 0.9, lay)
+    a = img.getchannel("A")
+    assert img.height >= 400 and max(a.getdata()) <= round(255 * ct.SCRIM_CAP) + 1
+    col = [a.getpixel((10, y)) for y in range(img.height)]
+    assert max(abs(col[i + 1] - col[i]) for i in range(len(col) - 1)) <= 8   # no hard edge
+    assert ct.render_scrim(tuple(ct.get_layout("16x9").cap_box), 0.5, ct.get_layout("16x9")) is None
+
+
+def test_scale_beats_and_events():
+    lay = ct.get_layout("9x16")
+    p = make_plan()
+    p["subject"]["segments"] = [{"beat": 0, "clip": "a", "in": 0, "out": 1.5}, {"beat": 1, "clip": "b", "in": 0, "out": 1.5, "subject_scale": 1.1,
+                                "transition_in": {"type": "push", "dur": 0.25}}]
+    assert compose.scale_at(p, lay, 0.5) == pytest.approx(1.0)
+    assert compose.scale_at(p, lay, 1.5) == pytest.approx(1.1 * 1.1, rel=1e-3)          # push-in starts 10 percent big
+    assert compose.scale_at(p, lay, 2.5) == pytest.approx(1.1, rel=1e-3)                # settled
+    assert "pow(" in compose._scale_expr(p, lay)
+
+
+def test_ratio_layouts_render_and_flash(assets, tmp_path):
+    p = make_plan()
+    p["meta"] = {"head": {"top_frac": 0.25, "bbox_frac": [0.1, 0.25, 0.9, 1.0]}}
+    p["subject"]["segments"] = [{"beat": 0, "clip": "a", "in": 0, "out": 1.5}, {"beat": 1, "clip": "b", "in": 0, "out": 1.5, "subject_scale": 1.08,
+                                "transition_in": {"type": "flash", "dur": 0.2}}]
+    p["subject"]["rim"] = {"enabled": True, "px": 2, "color": "#ffe9d2"}
+    for name, size, expect in (("1x1", (540, 540), "1x1"), ("16x9", (960, 540), "16x9"), ("9x16", (270, 480), "9x16")):
+        r = compose.render_composition(p, assets, tmp_path / f"{name}.mp4", size=size, workdir=tmp_path / f"w{name}")
+        assert r["layout"] == expect
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "stream=width,height", "-of", "csv=p=0", r["out"]],
+                               capture_output=True, text=True).stdout.strip()
+        assert probe == f"{size[0]},{size[1]}"
+        pv = compose.render_composition(p, assets, tmp_path / f"pv{name}", size=size, preview=True)
+        assert Image.open(pv["frames"][0]).size == (ct.layout_for_size(size).w // 2, ct.layout_for_size(size).h // 2)
+
+
+def test_hardening(assets, tmp_path, monkeypatch):
+    assert compose._assets_get({"backdrops": {}}, "backdrops", str(assets["master"])) is None   # no raw-path fallback
+    bad = make_plan()
+    del bad["subject"]
+    with pytest.raises(ValueError, match="invalid composition plan"):
+        compose.render_composition(bad, assets, tmp_path / "x.mp4")
+    assert len(compose._sha1("frame:a@1")) == 12 and compose._sha1("a") == compose._sha1("a")
+
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired(a[0], 1)
+    monkeypatch.setattr(compose.subprocess, "run", boom)
+    with pytest.raises(compose.ComposeFail, match="timed out"):
+        compose._run(["ffmpeg"], 1)
+    monkeypatch.undo()
+    out = tmp_path / "fail.mp4"
+    monkeypatch.setattr(compose, "FULL_TIMEOUT", 0.01)
+    with pytest.raises(compose.ComposeFail):
+        compose.render_composition(make_plan(), assets, out)
+    assert not out.exists()
