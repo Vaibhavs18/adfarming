@@ -22,8 +22,12 @@ CAPTIONS AS BURNED IN (time-ordered)
 
 Attached: 4 key frames from the finished 9:16 cut, in order: hook (0.6s), 2.5s, middle, and the LAST frame, which is
 the end-hold CTA card (the soft CTA text is overlaid on it).
+NOTE ON THE CTA: the on-screen cta_short (e.g. "Shop <brand>") is a soft end-card pill BY DESIGN and is never a
+hardness violation. Judge CTA hardness only on the SPOKEN CTA in the speech/captions, and flag any discount, price or
+urgency claim (spoken or on screen). Do not fail the reel because the short end-card text looks more direct than
+the concept's soft-CTA direction.
 Check: (1) hook lands in the first 3s, (2) no invented claims/prices/discounts, (3) captions match the speech and
-are readable, (4) the cut ends on a soft CTA direction, (5) subject stays framed, (6) length 12-25s.
+are readable, (4) the spoken CTA is soft (the end-card pill is exempt, see the note), (5) subject stays framed, (6) length 12-25s.
 JSON: {{"pass":true|false,"score":1-5,"issues":["..."],"fixes":["..."],"summary":"one sentence"}}"""
 
 

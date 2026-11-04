@@ -210,6 +210,83 @@ def retime_plan(plan: dict, concept: dict, captions: list[dict], assets_info: di
     return p
 
 
+CTA_WINDOW_S = 3.0         # the CTA end-card shows in (at most) the last 3 s of the master
+RESCALE_MIN_DELTA_S = 0.05
+
+
+def probe_duration(path) -> float | None:
+    """Duration of a media file in seconds; None when it cannot be probed (missing file, not a video)."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+                             capture_output=True, text=True, timeout=30, check=True).stdout.strip()
+        d = float(out)
+        return d if d > 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def rescale_to_master(plan: dict, master_dur: float | None) -> dict:
+    """The plan timeline must end where the master ends. Plan times come from the concept beats (+ end hold); the real
+    master can be longer (speech snapping, trims), so a callout placed at 8-11 s on plan time would sit at the wrong
+    moment, or after the end. Stretch text/overlay/background times by master/plan, set duration to the master, and
+    clamp the CTA window to the last CTA_WINDOW_S seconds. Speech-timed captions already live on master time."""
+    if not isinstance(master_dur, (int, float)) or master_dur <= 0:
+        return plan
+    d_new = round(float(master_dur), 2)
+    d_old = float(plan.get("duration") or 0)
+    if d_old > 0 and abs(d_new - d_old) >= RESCALE_MIN_DELTA_S:
+        f = d_new / d_old
+        for t in plan.get("text") or []:
+            t["start"] = round(float(t.get("start", 0)) * f, 2)
+            t["end"] = round(min(float(t.get("end", d_old)) * f, d_new), 2)
+        for o in plan.get("overlays") or []:
+            o["start"] = round(float(o.get("start", 0)) * f, 2)
+            o["end"] = round(min(float(o.get("end", d_old)) * f, d_new), 2)
+        for i, b in enumerate(plan.get("background") or []):
+            b["start"] = 0 if i == 0 else round(float(b.get("start", 0)) * f, 2)
+        plan["meta"] = dict(plan.get("meta") or {}, rescaled={"from": round(d_old, 2), "to": d_new})
+    plan["duration"] = d_new
+    for t in plan.get("text") or []:
+        if t.get("role") == "cta":
+            t["end"] = d_new
+            t["start"] = round(max(float(t.get("start", 0)), d_new - CTA_WINDOW_S, 0.0), 2)
+    return plan
+
+
+def subject_luma(master, matte) -> float | None:
+    """Median relative luminance (0-1) of the subject: master pixels where the matte is on, at 3 sample times.
+    None when it cannot be measured (the planner then assumes a dark saree)."""
+    try:
+        from PIL import Image
+        dur = probe_duration(master) or 0.0
+        lums = []
+        for frac in (0.25, 0.5, 0.75):
+            fr = []
+            for src, tag in ((master, "m"), (matte, "k")):
+                out = Path(str(matte)).with_name(f".luma_{tag}_{int(frac * 100)}.png")
+                subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{dur * frac:.2f}", "-i", str(src), "-frames:v", "1",
+                                "-vf", "scale=96:-2", str(out)], capture_output=True, timeout=30, check=True)
+                fr.append(Image.open(out).convert("RGB" if tag == "m" else "L"))
+                out.unlink(missing_ok=True)
+            rgb, mk = fr
+            px = [rgb.getpixel((x, y)) for y in range(rgb.height) for x in range(rgb.width)
+                  if mk.getpixel((min(x, mk.width - 1), min(y, mk.height - 1))) > 128]
+            if len(px) >= 20:
+                med = [sorted(c[i] for c in px)[len(px) // 2] for i in range(3)]
+                lums.append(_cp()._lum("#%02x%02x%02x" % tuple(med)))
+        return round(_median(lums), 4) if lums else None
+    except Exception:  # measuring is best effort; the planner has a safe default
+        return None
+
+
+def set_subject_luma(plan: dict, luma: float | None) -> dict:
+    if isinstance(luma, (int, float)) and not isinstance(luma, bool) and 0 <= luma <= 1:
+        meta = dict(plan.get("meta") or {})
+        meta["subject"] = dict(meta.get("subject") or {}, luma=round(float(luma), 4))
+        plan["meta"] = meta
+    return plan
+
+
 def degrade_plates(plan: dict, failed: list[str], concept: dict) -> dict:
     """A plate that could not be made becomes a gradient from its own palette; the preset is re-inferred."""
     if not failed:
@@ -789,6 +866,7 @@ class ComposeMixin:
         if failed:  # degrade_plates re-runs repair_plan, which resets duration/captions: redo the retime
             plan = retime_plan(plan, wc, meta.get("captions") or [], assets["info"])
         plan = self._cta_pass(plan, wc)
+        plan = rescale_to_master(plan, probe_duration(master))    # plan timeline ends where the master ends
         prompt = subject_prompt or ((plan.get("subject") or {}).get("mask") or {}).get("prompt") or "woman"
         if not self._cap_room(est_edit(plan["duration"])[0] - QC_USD):
             raise T.ToolError("cost_cap", "run cap would be exceeded by the matte + render", False,
@@ -798,6 +876,13 @@ class ComposeMixin:
         if not isinstance(mres, dict) or mres.get("error") or not mres.get("matte"):
             raise ComposeFail(f"matte failed: {clean_detail((mres or {}).get('error'), 200)}")
         set_head(plan, [mres])           # head box from the matte: headline above the head, callouts at the margin
+        lum = mres.get("subject_luma") if isinstance(mres.get("subject_luma"), (int, float)) else subject_luma(master, mres["matte"])
+        set_subject_luma(plan, lum)      # contrast lint + complementary beat 2 compare against the real saree
+        if lum is not None:              # re-derive with the measured luma (bg beat 2, contrast, rim), then redo the timeline
+            plan = retime_plan(plan, wc, meta.get("captions") or [], assets["info"])
+            plan = rescale_to_master(self._cta_pass(plan, wc), probe_duration(master))
+            set_head(plan, [mres])
+            set_subject_luma(plan, lum)
         clips = {k: str(_clip_path(v)) for k, v in self._clip_map().items()}
         rassets = {"master": str(master), "matte": mres["matte"], "backdrops": {**plates, **assets["backdrops"]},
                    "pip_images": assets["pips"], "clips": clips}

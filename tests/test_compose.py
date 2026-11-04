@@ -131,7 +131,7 @@ def test_render_deterministic_and_audio_copied(assets, tmp_path):
     h = [hashlib.sha256(o.read_bytes()).hexdigest() for o in outs]
     assert h[0] == h[1]
     info = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height", "-of", "csv", str(outs[0])],
-                          capture_output=True, text=True).stdout
+                          capture_output=True, text=True, timeout=60).stdout
     assert "h264,video,270,480" in info and "aac,audio" in info
     assert {x["kind"] for x in r["layers"]} == {"scrim", "caption", "text", "overlay"} and r["seconds"] > 0
 
@@ -154,6 +154,8 @@ def _held_assets(d, secs=9):
 
 
 def test_preview_subject_pixels_on_held_still_master(tmp_path):
+    """Regression for the black preview stills: a held-still 5 fps master whose first frame sits at pts 0.1 needs
+    setpts=PTS-STARTPTS on both inputs, else _subject_png returns (0,0,0,255) at the subject. Asserts RGB, not alpha."""
     a = _held_assets(tmp_path)
     p = make_plan()
     p["duration"] = 9
@@ -165,14 +167,20 @@ def test_preview_subject_pixels_on_held_still_master(tmp_path):
     p["captions"]["scrim"] = 0.5
     t = compose.best_preview_time(p, 0)
     assert 6.5 <= t <= 8.5                       # the headline is on screen at the preview time
-    r = compose.render_composition(p, a, tmp_path / "pv", preview=True)
-    im = Image.open(r["frames"][0]).convert("RGB")
-    cx = im.getpixel((270, 700))                 # inside the ellipse, below the headline
-    assert cx[2] > 120 and cx[2] > cx[0] + 40    # the blue subject, not black / bare background
-    p2 = copy.deepcopy(p)
+    subj_colour = (32, 96, 192)
     subj = tmp_path / "s.png"
-    compose._subject_png(a["master"], a["matte"], 7.5, p2, subj)
-    assert Image.open(subj).convert("RGBA").getpixel((540, 1400))[3] > 200
+    compose._subject_png(a["master"], a["matte"], 7.5, copy.deepcopy(p), subj)
+    sim = Image.open(subj).convert("RGBA")
+    r, g, b, al = sim.getpixel((540, 1400))      # inside the ellipse, 1080x1920 design space
+    assert al > 200
+    assert b > 120 and b > r + 40 and (r + g + b) > 0, (r, g, b)       # blue subject, never (0,0,0,255)
+    corner = sim.getpixel((5, 5))                 # outside the matte: transparent, and not the subject colour
+    assert corner[3] == 0 and sum(abs(x - y) for x, y in zip(corner[:3], subj_colour)) > 60
+    rr = compose.render_composition(p, a, tmp_path / "pv", preview=True)
+    im = Image.open(rr["frames"][0]).convert("RGB")
+    cx = im.getpixel((270, 700))                 # inside the ellipse, below the headline (half-size preview)
+    assert cx[2] > 120 and cx[2] > cx[0] + 40 and sum(cx) > 0
+    assert sum(abs(x - y) for x, y in zip(im.getpixel((3, 3)), subj_colour)) > 60
 
 
 def test_head_aware_text_and_callout():
@@ -204,7 +212,7 @@ def test_caption_baseline_and_soft_scrim():
     assert round(c1[1] + i1.height / 2) == round(c2[1] + i2.height / 2)      # same bottom edge: no jumping
     img, _ = ct.render_scrim(box, 0.9, lay)
     a = img.getchannel("A")
-    assert img.height >= 400 and max(a.getdata()) <= round(255 * ct.SCRIM_CAP) + 1
+    assert img.height >= 400 and max(a.tobytes()) <= round(255 * ct.SCRIM_CAP) + 1
     col = [a.getpixel((10, y)) for y in range(img.height)]
     assert max(abs(col[i + 1] - col[i]) for i in range(len(col) - 1)) <= 8   # no hard edge
     assert ct.render_scrim(tuple(ct.get_layout("16x9").cap_box), 0.5, ct.get_layout("16x9")) is None
@@ -231,7 +239,7 @@ def test_ratio_layouts_render_and_flash(assets, tmp_path):
         r = compose.render_composition(p, assets, tmp_path / f"{name}.mp4", size=size, workdir=tmp_path / f"w{name}")
         assert r["layout"] == expect
         probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "stream=width,height", "-of", "csv=p=0", r["out"]],
-                               capture_output=True, text=True).stdout.strip()
+                               capture_output=True, text=True, timeout=60).stdout.strip()
         assert probe == f"{size[0]},{size[1]}"
         pv = compose.render_composition(p, assets, tmp_path / f"pv{name}", size=size, preview=True)
         assert Image.open(pv["frames"][0]).size == (ct.layout_for_size(size).w // 2, ct.layout_for_size(size).h // 2)
@@ -256,3 +264,163 @@ def test_hardening(assets, tmp_path, monkeypatch):
     with pytest.raises(compose.ComposeFail):
         compose.render_composition(make_plan(), assets, out)
     assert not out.exists()
+
+
+# ---------- review fixes D1-D6: callout in the final video, wrapping, timeline, hook size, captions, seam ----------
+HEAD = {"top_frac": 0.2531, "bbox_frac": [0.0, 0.2531, 0.9981, 0.999]}
+PLATE = (255, 217, 138)
+
+
+def _callout(start, end, text="Perfect for festive"):
+    return {"id": "tag1", "role": "callout", "text": text, "region": "right_mid", "style": "callout_tag", "size": 54,
+            "fill": "#2a0e1a", "stroke": None, "plate": "#ffd98a", "rot": 0.0, "animation": "slide_right", "font": "latin",
+            "pill_text": None, "start": start, "end": end, "weight": "bold", "point": "shoulder"}
+
+
+def _frame(video, t, out):
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", str(t), "-i", str(video), "-frames:v", "1", str(out)], check=True, timeout=60)
+    return Image.open(out).convert("RGB")
+
+
+def _plate_px(im, tol=24):
+    return sum(1 for px in zip(*[iter(im.tobytes())] * 3) if all(abs(px[i] - PLATE[i]) <= tol for i in range(3)))
+
+
+def _tag_plan(start, end, dur=3):
+    p = make_plan()
+    p["duration"] = dur
+    p["meta"] = {"head": HEAD}
+    p["text"] = [_callout(start, end)]
+    p["captions"]["chunks"] = []
+    p["overlays"] = []
+    return p
+
+
+def test_callout_pixels_in_full_video_at_callout_time(assets, tmp_path):
+    p = _tag_plan(1.0, 2.6)
+    base = copy.deepcopy(p)
+    base["text"] = []
+    size = (540, 960)
+    on = compose.render_composition(p, assets, tmp_path / "on.mp4", size=size)
+    off = compose.render_composition(base, assets, tmp_path / "off.mp4", size=size)
+    assert any(x["id"] == "tag1" and x["kind"] == "text" for x in on["layers"])
+    at = _plate_px(_frame(on["out"], 1.9, tmp_path / "a.png"))
+    ref = _plate_px(_frame(off["out"], 1.9, tmp_path / "b.png"))
+    assert at - ref > 3000, (at, ref)                                  # the bubble is really in the final frames
+    assert _plate_px(_frame(on["out"], 0.4, tmp_path / "c.png")) - ref < 200   # and only inside its window
+
+
+def test_plan_stretched_to_longer_master_keeps_callout_on_screen(assets, tmp_path):
+    """Plan ends at 3 s, the master is 4.5 s: beats / text rescale to the master and the callout still renders."""
+    d = tmp_path
+    ff("-f", "lavfi", "-i", "testsrc2=s=270x480:r=30:d=4.5", "-f", "lavfi", "-i", "sine=f=440:d=4.5",
+       "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(d / "long_master.mp4"))
+    ff("-loop", "1", "-framerate", "30", "-t", "4.5", "-i", str(Path(assets["dir"]) / "m.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+       str(d / "long_matte.mp4"))
+    la = dict(assets, master=str(d / "long_master.mp4"), matte=str(d / "long_matte.mp4"))
+    p = _tag_plan(1.0, 1.6, dur=3)
+    p["text"].append({"id": "end", "role": "cta", "text": "Visit us", "cta_short": "Visit us", "region": "cta_top", "style": "cta_pill",
+                      "size": 58, "plate": "#e11d48", "fill": "#ffffff", "stroke": None, "rot": 0.0, "font": "latin", "pill_text": None,
+                      "start": 0.2, "end": 3.0, "animation": "pop"})
+    q = compose.fit_plan_to_master(copy.deepcopy(p), 4.5)
+    assert q["duration"] == pytest.approx(4.5)
+    tag = next(t for t in q["text"] if t["id"] == "tag1")
+    assert (tag["start"], tag["end"]) == (pytest.approx(1.5), pytest.approx(2.4))
+    cta = next(t for t in q["text"] if t["id"] == "end")
+    assert cta["end"] == pytest.approx(4.5) and cta["start"] >= 4.5 - compose.CTA_MAX_S - 1e-6   # last 3 s only
+    assert compose.fit_plan_to_master(copy.deepcopy(p), 3.05)["duration"] == 3     # within tolerance: untouched
+    r = compose.render_composition(p, la, tmp_path / "s.mp4", size=(540, 960))
+    assert r["duration"] == pytest.approx(4.5)
+    base = copy.deepcopy(p)
+    base["text"] = [t for t in base["text"] if t["id"] != "tag1"]
+    r0 = compose.render_composition(base, la, tmp_path / "s0.mp4", size=(540, 960))
+    ref = _plate_px(_frame(r0["out"], 2.0, tmp_path / "s0.png"))
+    assert _plate_px(_frame(r["out"], 2.0, tmp_path / "s1.png")) - ref > 3000     # on screen at 2.0 s (plan time 1.33 s)
+    assert _plate_px(_frame(r["out"], 0.9, tmp_path / "s2.png")) - ref < 200      # not before the stretched start 1.5 s
+
+
+def test_callout_never_wraps_inside_a_word():
+    lay = ct.get_layout("9x16")
+    for text in ("Perfect for festive", "Beginner friendly comfort", "Extraordinarily soft"):
+        for head in ((300.0, 428.0, 780.0, 940.0), (390.0, 428.0, 700.0, 940.0), (150.0, 428.0, 630.0, 940.0)):
+            tag = {"text": text, "region": "right_mid", "style": "callout_tag", "plate": "#ffd98a", "fill": "#2a0e1a", "stroke": None, "size": 54}
+            _, _, info = ct.render_block(tag, lay, head)
+            assert sorted(" ".join(info["lines"]).split()) == sorted(text.split()), (text, info["lines"])   # whole words only
+            assert info["ink_w"] <= lay.safe[2] - lay.safe[0]
+    # bubble width follows the measured text: at least the longest word + padding
+    f = ct.face(54)
+    img, _, info = ct.render_block({"text": "Extraordinarily soft", "region": "right_mid", "style": "callout_tag", "plate": "#ffd98a",
+                                    "fill": "#2a0e1a", "stroke": None, "size": 54}, lay, (390.0, 428.0, 700.0, 940.0))
+    assert info["ink_w"] >= f.length(ct._DUMMY, "Extraordinarily") * info["size"] / 54 + 2 * 26 - 2
+    # shrinks only when no region is wide enough, and never breaks the word
+    lines, size = ct.fit_text("Supercalifragilistic day", 80, 560, 400, 3)
+    assert size < 80 and "Supercalifragilistic" in lines
+
+
+def test_hook_is_big_above_head_after_cutout_shift():
+    p = _tag_plan(1.0, 2.0)
+    hook = {"id": "hook", "role": "hook", "text": "I could not wear it properly", "region": "top_center", "style": "pill_headline",
+            "size": 96, "plate": None, "stroke": [8, "#2a0e1a"], "weight": "black", "keyword": "wear", "start": 0.2, "end": 2.5,
+            "animation": "pop", "pill_text": "STORY"}
+    p["text"] = [hook]
+    for name, lo_size in (("9x16", 72), ("1x1", 60)):
+        lay = ct.get_layout(name)
+        dy = compose._hook_shift(p, lay)
+        assert 0 <= dy <= compose.HOOK_MAX_SHIFT[name]
+        if name == "9x16":
+            assert 40 <= dy <= 80
+        hb = compose.head_box(p, lay, 1.0)
+        _, _, info = ct.render_block(hook, lay, hb)
+        assert info["size"] >= lo_size and len(info["lines"]) <= 2, (name, info["size"], info["lines"])
+        assert info["box"][3] <= hb[1] - ct.HEAD_GAP + 2 and info["box"][1] >= lay.regions["top_center"][1] - 1
+        assert 0 < hb[1] and hb[3] < lay.h          # the head stays fully inside the frame
+        # the filter chain (full render AND previews) uses the same shift as the geometry
+        chain, _ = compose._subject_filters("[b]", "0:v", "1:v", p, lay, 30, 3, None, 1.0, ([], 2, "#fff"))
+        assert f"+{dy:.2f}" in " ".join(chain) or dy == 0
+    p9 = copy.deepcopy(p)
+    del p9["meta"]
+    assert compose._hook_shift(p9, ct.get_layout("9x16")) == 0           # no head box: untouched
+    assert compose._hook_shift(p, ct.get_layout("16x9")) == 0
+
+
+def test_caption_active_chunk_opaque_white_four_px_centred():
+    st = compose.caption_style({"fill": "#bbbbbb", "stroke": [9, "#220011"], "highlight": "#ffd98a"})
+    assert st["fill"] == "#ffffff" and st["stroke"] == [4, "#220011"] and ct.CAPTION_STROKE == 4
+    lay = ct.get_layout("16x9")
+    img, c, info = ct.render_caption("thanks for watching today", st, tuple(lay.cap_box), None, lay)
+    x0, x1 = lay.cap_box[0], lay.cap_box[2]
+    assert c[0] == pytest.approx((x0 + x1) / 2)                           # centred in the 16:9 column
+    assert info["size"] >= 56
+    for im, _ in ct.anim_frames(img, c, "pop", 8, fade_in=False):         # every frame fully opaque, incl. the first
+        assert max(im.getchannel("A").tobytes()) == 255
+    assert max(ct.anim_frames(img, c, "pop", 8)[0][0].getchannel("A").tobytes()) < 255   # (the default still fades)
+    white = sum(1 for px in zip(*[iter(img.convert("RGBA").tobytes())] * 4) if px[:3] == (255, 255, 255) and px[3] == 255)
+    assert white > 500                                                   # real pure-white glyph pixels
+    L = compose.Layer("cap0", "caption", 1.0, 2.0, [], (0, 0, 1, 1))
+    assert L.kind == "caption"
+
+
+def test_scrim_ramp_is_zero_at_top_and_has_no_seam(assets, tmp_path):
+    for name in ("9x16", "1x1"):
+        lay = ct.get_layout(name)
+        img, centre = ct.render_scrim(tuple(lay.cap_box), 0.9, lay)
+        a = img.getchannel("A")
+        col = [a.getpixel((7, y)) for y in range(img.height)]
+        ramp_end = next(i for i, v in enumerate(col) if v == max(col))
+        assert col[0] == 0 and ramp_end >= 370                           # exactly 0 at the top edge, ramp >= ~400 px
+        assert all(col[i + 1] >= col[i] for i in range(len(col) - 1))    # monotone: no lower edge, no step
+        assert col[-1] == max(col) and centre[1] + img.height / 2 == pytest.approx(lay.h)   # runs to the frame bottom
+    # rendered pixels: darkening the scrim adds (vs. no scrim) never decreases down the frame
+    p = make_plan()
+    p["text"], p["overlays"] = [], []
+    p["captions"]["chunks"] = [{"text": "plain words here", "start": 0.2, "end": 2.8}]
+    q = copy.deepcopy(p)
+    q["captions"]["scrim"] = 0.0
+    p["captions"]["scrim"] = 0.5
+    size = (270, 480)
+    fa = _frame(compose.render_composition(p, assets, tmp_path / "sc1.mp4", size=size)["out"], 1.5, tmp_path / "sc1.png").convert("L")
+    fb = _frame(compose.render_composition(q, assets, tmp_path / "sc0.mp4", size=size)["out"], 1.5, tmp_path / "sc0.png").convert("L")
+    d = [fb.getpixel((2, y)) - fa.getpixel((2, y)) for y in range(size[1])]      # darkening per row, bg-only column
+    assert max(abs(v) for v in d[: int(size[1] * 0.55)]) <= 3                    # nothing above the ramp top (~55 percent)
+    assert all(d[i + 1] >= d[i] - 3 for i in range(len(d) - 1))                 # monotone ramp, no seam / step back
+    assert d[-1] >= 4                                                            # and the scrim is really there

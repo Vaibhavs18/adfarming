@@ -41,12 +41,13 @@ ROLE_STYLE: dict[str, dict] = {
             "shadow": True, "animation": "pop", "max_lines": 1},
     "callout": {"size": 64, "fill": "#2a0a1a", "stroke": [0, "#000000"], "bg": {"fill": "#fbbf24", "radius": 30, "pad": 26},
                 "rot": -6, "tail": "auto", "shadow": True, "animation": "slide_left", "max_lines": 3},
-    "caption": {"size": 84, "fill": "#ffffff", "stroke": [9, "#1a0a14"], "hl": "#fde047", "animation": "pop", "max_lines": 2},
+    "caption": {"size": 84, "fill": "#ffffff", "stroke": [4, "#1a0a14"], "hl": "#fde047", "animation": "pop", "max_lines": 2},
 }
 SCRIM_ALPHA = 0.62   # requested scrim strength (the renderer caps what is drawn at SCRIM_CAP: stroke + shadow carry the rest)
 SCRIM_CAP = 0.35
 SCRIM_MIN_H = 400    # the gradient scrim is at least this tall so it never reads as a rectangle
 WEIGHT_HEAVY = {"regular": 0, "bold": 2, "black": 3}
+CAPTION_STROKE = 4   # px: active caption = full-opacity white with this outline
 HEAD_GAP = 24        # clear space kept between a headline and the top of the head
 
 
@@ -221,6 +222,11 @@ def fit_text(text: str, size: int, max_w: float, max_h: float, max_lines: int, s
     """Shrink the font in 2 px steps until the wrapped text fits (width, height, line count) or the floor is hit."""
     s = size
     floor = max(16, int(size * min_scale))
+    words = [w for para in text.split("\n") for w in para.split()]
+    if words:   # wrap on spaces only: shrink until the longest word fits on one line (before any hard break)
+        longest = max(words, key=lambda w: face(size).length(_DUMMY, w))
+        while s > floor and face(s).length(_DUMMY, longest) > max_w - 2 * stroke:
+            s -= 2
     while True:
         lines = wrap_text(text, s, max_w, stroke)
         if (len(lines) <= max_lines and len(lines) * s * line_h <= max_h) or s <= floor:
@@ -298,6 +304,15 @@ def visible_text(item: dict) -> str:
     return str(item["text"])
 
 
+def hook_room(item: dict, lay: "Layout", size: int) -> int:
+    """Pixels a headline needs above the head to be set at `size` (its natural line count, max 2), incl. outline slack."""
+    st = resolve_style(item, lay)
+    x0, _, x1, _ = text_box(item, lay)
+    lines = wrap_text(visible_text(item), size, (x1 - x0) - 16, int(st["stroke"][0]) + int(st.get("heavy", 0) or 0))
+    n = min(len(lines), int(st.get("max_lines", 2)))
+    return int(n * int(size * float(st.get("lh", 1.34))) + int(int(st["size"]) * 0.12) + 4)
+
+
 # ---------- block artwork ----------
 _STOP = {"the", "and", "with", "from", "this", "that", "your", "for", "phir", "bhi", "thi", "hai", "aur", "ke", "ki", "ka", "ko"}
 
@@ -347,7 +362,7 @@ def _draw_words(d: ImageDraw.ImageDraw, f: Face, lines: list[str], cx: float, y:
             k += 1
 
 
-def _callout_box(lay: "Layout", head: tuple, st: dict, base_box: tuple) -> tuple[tuple, str, str]:
+def _callout_box(lay: "Layout", head: tuple, st: dict, base_box: tuple, min_w: float = 0.0) -> tuple[tuple, str, str]:
     """Callouts never sit on the face: beside the head in the free side margin when it is wide enough, else on the
     shoulder under the chin, hugging the margin on the side with more room. Returns (box, side, valign)."""
     hx0, hy0, hx1, hy1 = head
@@ -355,11 +370,13 @@ def _callout_box(lay: "Layout", head: tuple, st: dict, base_box: tuple) -> tuple
     sx0, sy0, sx1, sy1 = lay.safe
     limit = min(sy1, lay.cap_box[1] - 16)     # never down into the caption zone
     free = (hx0 - 24 - sx0) if side == "left" else (sx1 - (hx1 + 24))
-    if free >= 200:   # beside the head, at jaw height, in the free side margin
+    shoulder_top = hy1 + 36
+    shoulder_ok = shoulder_top <= limit - 170            # room under the chin above the caption zone (not squeezed up onto the face)
+    if free >= 200 and (free >= min_w or not shoulder_ok):   # beside the head at jaw height; too narrow for the longest word -> shoulder if it fits
         top = hy0 + 0.40 * (hy1 - hy0)
         wid = min(free, 430)
     else:             # on the shoulder, below the chin
-        top = hy1 + 36
+        top = shoulder_top
         wid = 430
     top = min(top, limit - 170)
     bot = min(top + 400, limit)
@@ -385,7 +402,10 @@ def render_block(item: dict, lay: "Layout | None" = None, head: tuple | None = N
         if region == "top_center" and role in ("hook", "other") and head[0] < x1 and head[2] > x0:
             y1 = max(y0 + 150, min(y1, int(head[1]) - HEAD_GAP))
         elif role == "callout" and region in ("left_mid", "right_mid") and lay.anchor in ("bottom", "head") and lay.name != "16x9":
-            (x0, y0, x1, y1), side, valign = _callout_box(lay, head, st, (x0, y0, x1, y1))
+            cbg = st.get("bg")
+            lw = max((face(int(st["size"])).length(_DUMMY, w) for w in visible_text(item).split()), default=0.0)
+            need = lw + 2 * (int(cbg["pad"]) if cbg else 0) + (24 if cbg else 0) + 16 + 8   # longest word + padding
+            (x0, y0, x1, y1), side, valign = _callout_box(lay, head, st, (x0, y0, x1, y1), need)
             ralign = side
     if st.get("pill") and region == "top_center" and (y1 - y0) < 262:   # squeezed under the head: the label pill goes first
         st["pill"] = None
@@ -511,8 +531,7 @@ def render_caption(text: str, st: dict, box: tuple[int, int, int, int], hl_index
     sh.putalpha(img.getchannel("A").point(lambda v: int(v * 0.6)))
     sh = ImageChops.offset(sh.filter(ImageFilter.GaussianBlur(9)), 0, 6)
     img = Image.alpha_composite(sh, img)
-    ralign = lay.regions["bottom_caption"][4] if box == tuple(lay.cap_box) else "center"
-    cx = (x0 + img.width / 2 - pad) if ralign == "left" else (x0 + x1) / 2
+    cx = (x0 + x1) / 2     # centred in its box, also in the 16:9 side column
     cy = y1 + pad - img.height / 2 + 6     # bottom-anchored: the last line's baseline never moves
     return img, (cx, cy), {"size": size, "lines": lines, "w": img.width, "h": img.height,
                            "fits": (len(lines) * size * 1.34 <= (y1 - y0)) and tw <= (x1 - x0) + 40}
@@ -520,22 +539,23 @@ def render_caption(text: str, st: dict, box: tuple[int, int, int, int], hl_index
 
 def render_scrim(box: tuple[int, int, int, int], strength: float = SCRIM_ALPHA, lay: "Layout | None" = None
                  ) -> tuple[Image.Image, tuple[float, float]] | None:
-    """Soft dark gradient behind captions: full width, smoothstep ramp over >= SCRIM_MIN_H px, peak alpha capped at
-    SCRIM_CAP (a thick outline and a text shadow carry legibility), so it never reads as a hard-edged rectangle.
-    None when the layout draws no scrim (16:9 puts captions in a side column)."""
+    """Soft dark bottom gradient behind captions: full width, alpha EXACTLY 0 at its top edge, a smoothstep ramp over
+    SCRIM_MIN_H px up to the caption box bottom, then the peak (capped at SCRIM_CAP) continues to the frame bottom so
+    there is no lower edge either: no horizontal seam anywhere. None when the layout draws no scrim (16:9)."""
     lay = lay or get_layout("9x16")
     strength = min(float(strength), SCRIM_CAP)
     if strength <= 0 or not lay.scrim:
         return None
     x0, y0, x1, y1 = box
-    bot = min(lay.h, y1 + 60)
-    top = max(0, bot - max(SCRIM_MIN_H + 60, 480))
-    h = bot - top
-    up_len, dn_len = h - 60, 60
+    end = min(lay.h, int(y1))
+    top = max(0, end - SCRIM_MIN_H)
+    ramp = max(1, end - top)
+    h = lay.h - top
     vals = []
     for y in range(h):
-        up, dn = min(1.0, y / float(up_len)), min(1.0, (h - y) / float(dn_len))
-        vals.append(int(round(255 * strength * min(up * up * (3 - 2 * up), dn * dn * (3 - 2 * dn)))))
+        u = min(1.0, y / float(ramp))
+        vals.append(int(round(255 * strength * u * u * (3 - 2 * u))))
+    vals[0] = 0
     col = Image.new("L", (1, h))
     col.putdata(vals)
     img = Image.new("RGBA", (lay.w, h), (12, 4, 10, 0))
@@ -582,14 +602,16 @@ def ease_out(t: float) -> float:
 ANIMATIONS = ("pop", "slide_left", "slide_right", "fade", "none")
 
 
-def anim_frames(img: Image.Image, center: tuple[float, float], kind: str, n: int = 9) -> list[tuple[Image.Image, tuple[int, int]]]:
-    """Entrance as n RGBA frames with top-left positions. The LAST frame is the resting pose (held by the renderer)."""
+def anim_frames(img: Image.Image, center: tuple[float, float], kind: str, n: int = 9, fade_in: bool = True
+                ) -> list[tuple[Image.Image, tuple[int, int]]]:
+    """Entrance as n RGBA frames with top-left positions. The LAST frame is the resting pose (held by the renderer).
+    fade_in=False keeps every frame fully opaque (captions: scale pop only, never a translucent grey first frame)."""
     if kind == "none":
         n = 1
     out = []
     for k in range(n):
         p = (k + 1) / n
-        a = min(1.0, p * 1.6) if kind != "none" else 1.0
+        a = min(1.0, p * 1.6) if (kind != "none" and fade_in) else 1.0
         sc, dx = 1.0, 0
         if kind == "pop":
             sc = 0.55 + 0.45 * ease_out_back(p)

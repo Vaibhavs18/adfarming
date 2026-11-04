@@ -57,6 +57,10 @@ HELPER_TIMEOUT = 120      # seconds: any helper ffmpeg/ffprobe call
 HEAD_W_FRAC = 0.46        # head box width as a fraction of the master frame width
 HEAD_H_FRAC = 0.22        # head box height (hair top to chin) as a fraction of the master frame height
 DEFAULT_HEAD_TOP = 0.29
+HOOK_TARGET = 84          # px: the headline size the layout makes room for above the head (never below 72 once shifted)
+HOOK_MAX_SHIFT = {"9x16": 80.0, "1x1": 40.0}   # px the cut-out may be pushed down to give a two-line hook room
+CTA_MAX_S = 3.0           # the on-screen CTA pill lives in the last 3 s only
+RESCALE_TOL = 0.15        # master vs plan length difference (s) below which the plan timeline is left alone
 HEAD_TOP_SLACK = 0.03    # hair flyaways / pose changes put the real top this far above the matte's median head top
 
 
@@ -232,10 +236,11 @@ def _geom(plan: dict, lay: ct.Layout, S: float) -> tuple[float, float, float, fl
     tr = (plan.get("subject") or {}).get("transform") or {}
     sw, sh = W * S, H * S
     x = lay.sub_cx + float(tr.get("x", 0)) - sw / 2
+    dy = _hook_shift(plan, lay)
     if lay.anchor == "bottom":
-        y = lay.h - sh + float(tr.get("y", 0))
+        y = lay.h - sh + float(tr.get("y", 0)) + dy
     else:
-        y = lay.head_y - _head_meta(plan)[0] * H * S + float(tr.get("y", 0))
+        y = lay.head_y - _head_meta(plan)[0] * H * S + float(tr.get("y", 0)) + dy
     return x, y, sw, sh
 
 
@@ -247,6 +252,41 @@ def _head_meta(plan: dict) -> tuple[float, list[float], bool]:
     top = float(top) if ok else DEFAULT_HEAD_TOP
     bb = [float(v) for v in bb] if isinstance(bb, (list, tuple)) and len(bb) == 4 else [0.05, top, 0.95, 1.0]
     return top, bb, ok
+
+
+def _hook_item(plan: dict) -> dict | None:
+    for t in plan.get("text") or []:
+        if t.get("region", "top_center") == "top_center" and (t.get("role") == "hook" or t.get("style") == "pill_headline"):
+            return t
+    return None
+
+
+def _hook_shift(plan: dict, lay: ct.Layout) -> float:
+    """Pixels the cut-out is pushed DOWN so the headline can be set big above the head. 0 when the plan has no head box,
+    no hook, the layout puts the hook beside the head (16:9), or the hook already fits at HOOK_TARGET. Static for the
+    whole video (no jumping), capped (80 px in 9:16, 40 px in 1:1); the head stays inside the frame."""
+    cap = HOOK_MAX_SHIFT.get(lay.name)
+    top, _, ok = _head_meta(plan)
+    hk = _hook_item(plan)
+    if not cap or not ok or hk is None:
+        return 0.0
+    tr = (plan.get("subject") or {}).get("transform") or {}
+    D = float(plan["duration"])
+    S = float(tr.get("scale", 1.0)) * lay.sub_scale * max(b["scale"] for b in _subject_beats(plan, D))
+    size = min(int(ct.resolve_style(hk, lay)["size"]), HOOK_TARGET)
+    need = ct.hook_room(hk, lay, size) + ct.HEAD_GAP
+    y0 = ct.text_box(hk, lay)[1]
+    if lay.anchor == "bottom":
+        head_top = lay.h - H * S + (top - HEAD_TOP_SLACK) * H * S
+    else:
+        head_top = lay.head_y - HEAD_TOP_SLACK * H * S
+    head_top += float(tr.get("y", 0))
+    short = need - (head_top - y0)
+    if short <= 0:
+        return 0.0
+    dy = min(cap, float(-(-short // 2) * 2))
+    # never push the head's lower half out of the frame
+    return float(max(0.0, min(dy, lay.h - (head_top + HEAD_H_FRAC * H * S) - 40)))
 
 
 def head_box(plan: dict, lay: ct.Layout, t: float) -> tuple[float, float, float, float] | None:
@@ -379,7 +419,7 @@ class Layer:
         k = min(len(self.paths) - 1, int((t - self.start) * fps))
         im = Image.open(self.paths[k]).convert("RGBA")
         left = self.end - t
-        if left < FADE_OUT:
+        if self.kind != "caption" and left < FADE_OUT:   # captions cut out hard: never a half-grey caption
             a = max(0.0, left / FADE_OUT)
             im.putalpha(im.getchannel("A").point(lambda v: int(v * a)))
         return im
@@ -400,6 +440,18 @@ def _pip_source(o: dict, assets: dict, workdir: Path) -> Path | None:
     return Path(p) if p else None
 
 
+def caption_style(cap: dict) -> dict:
+    """The active caption look: full-opacity white, CAPTION_STROKE (4 px) outline in the plan's outline colour, the
+    highlight word in the plan's highlight colour."""
+    cst = {**ct.ROLE_STYLE["caption"]}
+    cst["fill"] = "#ffffff"
+    cst["hl"] = cap.get("highlight") or cst["hl"]
+    sk = cap.get("stroke")
+    col = sk[1] if isinstance(sk, (list, tuple)) and len(sk) > 1 else cst["stroke"][1]
+    cst["stroke"] = [ct.CAPTION_STROKE, col]
+    return cst
+
+
 def build_layers(plan: dict, assets: dict, workdir: Path, lay: ct.Layout | None = None) -> list[Layer]:
     """Render every text/caption/scrim/PiP layer to PNG sequences (same code feeds the full render and the stills)."""
     lay = lay or ct.get_layout("9x16")
@@ -415,15 +467,10 @@ def build_layers(plan: dict, assets: dict, workdir: Path, lay: ct.Layout | None 
             s, e = max(0.0, chunks[0]["start"] - 0.2), min(D, chunks[-1]["end"] + 0.2)
             paths, xywh = ct.save_sequence(ct.anim_frames(sc[0], sc[1], "fade", 6), workdir, "scrim", cv)
             layers.append(Layer("scrim", "scrim", s, e, paths, xywh))
-    cst = {**ct.ROLE_STYLE["caption"]}
-    cst["fill"] = cap.get("fill") or cst["fill"]
-    cst["hl"] = cap.get("highlight") or cst["hl"]
-    if cap.get("stroke") is not None:
-        cst["stroke"] = cap["stroke"]
-    cst["stroke"] = [int(cst["stroke"][0]), cst["stroke"][1]]
+    cst = caption_style(cap)
     for i, ch in enumerate(chunks):
         img, c, info = ct.render_caption(ch["text"], cst, cbox, ch.get("hl"), lay)
-        paths, xywh = ct.save_sequence(ct.anim_frames(img, c, "pop", 8), workdir, f"cap{i:02d}", cv)
+        paths, xywh = ct.save_sequence(ct.anim_frames(img, c, "pop", 8, fade_in=False), workdir, f"cap{i:02d}", cv)
         layers.append(Layer(f"cap{i}", "caption", ch["start"], min(D, ch["end"]), paths, xywh, info))
     for t in plan.get("text") or []:
         mid = (float(t["start"]) + min(D, float(t["end"]))) / 2
@@ -487,7 +534,7 @@ def _subject_filters(cur: str, vi: str, mi: str, plan: dict, lay: ct.Layout, fps
     ]
     if rim_ranges:
         col = rim_col.lstrip("#")
-        f.append(f"[al2]gblur=sigma={rim_px * 1.1:.2f},lut=y='clip(val*2.4,0,255)*0.85',format=gray[rg]")
+        f.append(f"[al2]gblur=sigma={rim_px * 2.0:.2f},lut=y='clip(val*1.5,0,255)*0.42',format=gray[rg]")
         f.append(f"color=c=0x{col}:s={W}x{H}:r={fps}:d={dur:.3f},format=yuv420p[rc]")
         f.append("[rc][rg]alphamerge[rim0]")
     names = ["shd", "rim", "sub"] if rim_ranges else ["shd", "sub"]
@@ -500,6 +547,7 @@ def _subject_filters(cur: str, vi: str, mi: str, plan: dict, lay: ct.Layout, fps
             f.append(f"{src}scale={sw}:{sh}:flags=bicubic[{nm}]")
     cx = lay.sub_cx + float(tr.get("x", 0))
     xe = f"{cx:.2f}-overlay_w/2"
+    ty += _hook_shift(plan, lay)      # cut-out pushed down when the hook needs headroom (same shift as _geom)
     ye = f"{lay.h}-overlay_h+{ty:.2f}" if lay.anchor == "bottom" else f"{lay.head_y:.2f}-{htop * H:.2f}*overlay_h/{H}+{ty:.2f}"
     f.append(f"{cur}[shd]overlay=x='{xe}':y='{ye}+14':format=auto[l0]")
     cur = "[l0]"
@@ -628,15 +676,15 @@ def lint_render_inputs(plan: dict, assets: dict, size=None) -> list[str]:
         if scrim < 0.35:
             probs.append(f"caption scrim {scrim} is under 0.35: captions will be hard to read over busy saree/hands")
         cbox = tuple(lay.cap_box)
-        cst = ct.ROLE_STYLE["caption"]
+        cst = caption_style(cap)
         local = region_color(cbox, cap["chunks"][0]["start"])
         if local:
             eff = ct.blend((12, 4, 10), local, min(scrim, ct.SCRIM_CAP) if lay.scrim else 0.0)
-            ratio = ct.contrast_ratio(cap.get("fill") or cst["fill"], eff)
+            ratio = ct.contrast_ratio(cst["fill"], eff)
             if ratio < 3.0:
                 probs.append(f"captions: low contrast {ratio:.1f}:1 even on the scrim: raise scrim or darken the background")
         for i, c in enumerate(cap["chunks"]):
-            _, _, info = ct.render_caption(c["text"], {**cst, "stroke": cap.get("stroke") or cst["stroke"]}, cbox, None, lay)
+            _, _, info = ct.render_caption(c["text"], cst, cbox, None, lay)
             if not info["fits"]:
                 probs.append(f"caption {i} '{c['text'][:24]}' does not fit two lines at the caption size")
     for o in plan.get("overlays") or []:
@@ -715,6 +763,9 @@ def render_composition(plan: dict, assets: dict, out_path: str | Path, *, size: 
         if md and md + 0.1 < D:
             D = round(md, 3)
             plan["duration"] = D
+        elif not preview:
+            fit_plan_to_master(plan, md)
+            D = float(plan["duration"])
         layers = build_layers(plan, assets, wd, lay)
         if preview:
             r = _preview(plan, assets, master, matte, layers, out_path, wd, fps, t0, lay)
@@ -730,6 +781,32 @@ def render_composition(plan: dict, assets: dict, out_path: str | Path, *, size: 
             own_tmp.cleanup()
         if not ok and not preview:
             out_path.unlink(missing_ok=True)   # never leave a half-written mp4 behind
+
+
+def fit_plan_to_master(plan: dict, master_s: float) -> dict:
+    """Make the plan timeline match the master. A master longer than the plan (e.g. the end hold added after the plan was
+    written) stretches every plan-timed beat, text block, PiP and plan-timed caption by master/plan so nothing ends early;
+    speech-timed (asr) captions already sit on the master timeline and are left alone. The CTA pill is then clamped to
+    the last CTA_MAX_S seconds and runs to the end. Returns the plan (modified in place)."""
+    D = float(plan["duration"])
+    if master_s and master_s > D + RESCALE_TOL:
+        k = master_s / D
+        for b in plan.get("background") or plan.get("backgrounds") or []:
+            b["start"] = round(float(b.get("start", 0)) * k, 3)
+        for o in (plan.get("text") or []) + (plan.get("overlays") or []):
+            o["start"], o["end"] = round(float(o["start"]) * k, 3), round(float(o["end"]) * k, 3)
+        cap = plan.get("captions") or {}
+        if cap.get("source") != "asr":
+            for c in cap.get("chunks") or []:
+                c["start"], c["end"] = round(float(c["start"]) * k, 3), round(float(c["end"]) * k, 3)
+        plan["meta"] = dict(plan.get("meta") or {}, rescaled={"from": round(D, 3), "to": round(master_s, 3)})
+        D = round(master_s, 3)
+        plan["duration"] = D
+    for t in plan.get("text") or []:
+        if t.get("role") == "cta" or t.get("style") == "cta_pill":
+            t["start"] = round(min(max(float(t["start"]), D - CTA_MAX_S), max(D - 1.0, 0.0)), 3)
+            t["end"] = D
+    return plan
 
 
 def _full(plan, assets, master, matte, layers, out: Path, wd: Path, size, fps, t0, D, lay: ct.Layout) -> dict:
@@ -789,8 +866,9 @@ def _full(plan, assets, master, matte, layers, out: Path, wd: Path, size, fps, t
         x, y, cw, ch = L.xywh
         dur = L.end - L.start
         hold = max(0.0, dur - len(L.paths) / fps) + 0.1
+        fout = "" if L.kind == "caption" else f"fade=t=out:st={max(0.0, dur - FADE_OUT):.3f}:d={FADE_OUT}:alpha=1,"
         fc.append(f"[{ii}:v]format=rgba,tpad=stop_mode=clone:stop_duration={hold:.3f},"
-                  f"fade=t=out:st={max(0.0, dur - FADE_OUT):.3f}:d={FADE_OUT}:alpha=1,setpts=PTS-STARTPTS+{L.start:.3f}/TB[a{li}]")
+                  f"{fout}setpts=PTS-STARTPTS+{L.start:.3f}/TB[a{li}]")
         fc.append(f"{cur}[a{li}]overlay={x}:{y}:enable='between(t,{L.start:.3f},{L.end:.3f})':format=auto:eof_action=pass[o{li}]")
         cur = f"[o{li}]"
     scale = f"scale={size[0]}:{size[1]}:flags=lanczos," if tuple(size) != (lay.w, lay.h) else ""

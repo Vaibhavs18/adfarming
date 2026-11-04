@@ -60,6 +60,8 @@ HEADLINE_MIN_SIZE = 56
 DEFAULT_HEAD_TOP = 0.29      # used only when the agent supplied a head box without top_frac
 SUBJECT_LUMA = 0.04          # a dark saree: relative luminance assumed when the matte did not measure it
 MIN_BG_CONTRAST = 1.6        # background vs subject luminance contrast ratio
+RIM_COLOUR = "#e8c9a0"       # soft warm rim, not white
+RIM_OPACITY = 0.4            # max rim opacity: a hint of separation, never a hard white halo
 RIM_LUMA = 0.2               # below this background luminance the subject gets a light rim / outer glow
 CALLOUT_W = 0.30             # callout box width as a fraction of frame width (side margins)
 HEAD_HALF_W = 0.13           # half head width as a fraction of frame width
@@ -231,6 +233,49 @@ def _bg_luma(bg: dict) -> float:
 def _lum_contrast(l1: float, l2: float) -> float:
     hi, lo = max(l1, l2), min(l1, l2)
     return (hi + 0.05) / (lo + 0.05)
+
+
+def _hue(h: str) -> float | None:
+    """Hue in degrees (None for greys)."""
+    import colorsys
+    r, g, b = (v / 255 for v in _hex_rgb(h))
+    hh, ss, vv = colorsys.rgb_to_hsv(r, g, b)
+    return None if ss < 0.08 else hh * 360
+
+
+def _hue_dist(a: float | None, b: float | None) -> float:
+    if a is None or b is None:
+        return 180.0
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+
+# complementary second-beat gradients (mid-tone, never near-white): warm gold / brocade / cream-sand for the usual
+# maroon-plum-wine brand colours, cooler dusty tones only when the brand colour itself is gold
+WARM_BEATS = [["#a8782e", "#d9b25f"], ["#8f5f27", "#c99a4e"], ["#b89a6a", "#d8c08f"]]
+COOL_BEATS = [["#2f6f6a", "#6fa89f"], ["#3d5a80", "#7d9cc4"]]
+
+
+def complement_beat(cols: list[str], subject_luma: float) -> list[str]:
+    """Colours for background beat 2: complementary to the brand colour, separated from the subject by luminance."""
+    hues = [h for h in (_hue(c) for c in cols if _is_hex(c)) if h is not None]
+    gold = bool(hues) and all(25 <= h <= 75 for h in hues)
+    pool = COOL_BEATS if gold else WARM_BEATS
+
+    def score(c):
+        luma = sum(_lum(x) for x in c) / len(c)
+        d = min((_hue_dist(_hue(c[1]), h) for h in hues), default=180.0)
+        return _lum_contrast(luma, subject_luma) + d / 90.0
+    return list(max(pool, key=score))
+
+
+def _same_family(a: list[str], b: list[str]) -> bool:
+    """True when two gradients share a hue family (e.g. a lightened copy of the first beat)."""
+    ha = [h for h in (_hue(c) for c in a) if h is not None]
+    hb = [h for h in (_hue(c) for c in b) if h is not None]
+    if not ha or not hb:
+        return False
+    return min(_hue_dist(x, y) for x in ha for y in hb) < 20
 
 
 def _mix_white(h: str, f: float) -> str:
@@ -449,6 +494,11 @@ def _lint_semantics(plan, concept, hard_rules, assets_info) -> list[dict]:
         if ratios and max(ratios) < MIN_BG_CONTRAST:
             probs.append(_p("bg_contrast", "background", f"no background beat separates from the subject (luminance contrast "
                             f"{max(ratios):.2f} < {MIN_BG_CONTRAST}); use a lighter beat"))
+        gs = [b for b in bgs if isinstance(b, dict) and b.get("kind") == "gradient"]
+        if plan.get("preset") == "cutout_on_brand_colour" and len(gs) >= 2 and len(gs) == len(bgs) \
+                and _same_family(_bg_colors(gs[0]), _bg_colors(gs[1])):
+            probs.append(_p("bg_complement", "background/1", "background beat 2 is the same hue family as beat 1: use a "
+                            "complementary warm gold/cream/brocade beat so the saree does not merge into the background"))
         if any(_bg_luma(b) < RIM_LUMA for b in bgs if isinstance(b, dict)) and not (rim.get("enabled") and _num(rim.get("px")) >= 2):
             probs.append(_p("rim_light", "subject/rim", f"a background is darker than luma {RIM_LUMA}: enable subject.rim (>= 2 px light "
                             "rim / outer glow)"))
@@ -742,7 +792,8 @@ def repair_plan(plan: dict, problems: list[dict] | None = None, concept: dict | 
         sub["segments"] = segs_out
     rim = sub.get("rim") if isinstance(sub.get("rim"), dict) else {}
     sub["rim"] = {"enabled": bool(rim.get("enabled", False)), "px": int(_clamp(_num(rim.get("px"), 2), 1, 6)),
-                  "color": rim.get("color") if _is_hex(rim.get("color")) else "#fff3e0"}
+                  "color": rim.get("color") if _is_hex(rim.get("color")) else RIM_COLOUR,
+                  "opacity": round(_clamp(_num(rim.get("opacity"), RIM_OPACITY), 0.1, RIM_OPACITY), 2)}
     sub.setdefault("mask", {"prompt": "woman", "feather": 2.0, "edge": [0.35, 0.65]})
     sub.setdefault("transform", {"scale": 1.0, "x": 0, "y": 0})
     sub.setdefault("shadow", 0.5)
@@ -792,12 +843,16 @@ def repair_plan(plan: dict, problems: list[dict] | None = None, concept: dict | 
     if dur >= 6 and all(b["kind"] == "gradient" for b in bgs) and len(bgs) < 2:
         c = bgs[0]["colors"]
         mid = min((w[0] for w in wins[1:]), key=lambda x: abs(x - dur / 2), default=round(dur / 2, 2))
-        bgs.append({"id": "bg2", "kind": "gradient", "colors": [_mix_white(c[-1], 0.4), _mix_white(c[0], 0.2)], "src": None,
+        bgs.append({"id": "bg2", "kind": "gradient", "colors": complement_beat(c, _subject_luma(plan)), "src": None,
                     "prompt": None, "blur": 0, "zoom": 1.08, "dim": 1.0, "start": round(_clamp(mid, 1.0, dur - 1.0), 2),
                     "transition_in": {"type": "fade", "dur": 0.5}})
-        note("second background beat added (a lighter gradient) so the reel is not one flat colour")
+        note("second background beat added (complementary warm gold/cream tone) so the saree does not merge into the background")
     sl = _subject_luma(plan)
     grads = [b for b in bgs if b["kind"] == "gradient"]
+    if plan.get("preset") in (None, "cutout_on_brand_colour") and len(grads) >= 2 and len(grads) == len(bgs) \
+            and _same_family(grads[0]["colors"], grads[1]["colors"]):
+        grads[1]["colors"] = complement_beat(grads[0]["colors"], sl)
+        note(f"{grads[1]['id']}: recoloured complementary (it was the same hue family as beat 1, saree would merge)")
     if grads and max(_lum_contrast(_bg_luma(b), sl) for b in bgs) < MIN_BG_CONTRAST:
         bg, k = grads[-1], 0
         while _lum_contrast(_bg_luma(bg), sl) < MIN_BG_CONTRAST + 0.4 and k < 10:
@@ -1181,7 +1236,7 @@ RULES
 - Contrast: text fill must have contrast >= 4.5 against its plate (or the dimmed background); captions.scrim >= 0.4.
 - Add motion variety: different animations per block, background zoom 1.0-1.15.
 - The visible CTA is a SHORT separate line (at most 4 words, e.g. "Shop Maheshwari"), never an internal direction: no " - ", "card", "soft", "end". Set the cta block's cta_short to the same text. Every text is at most 80 characters.
-- Backgrounds: on cutout_on_brand_colour use at least 2 background beats (the second a clearly lighter mid-tone gradient, luminance 0.15-0.45, from about the middle, at a beat boundary; never near-white), never a still with people, and keep the background's luminance different from the saree so she separates. If a background is dark (luma < 0.2) set subject.rim.enabled true (px >= 2).
+- Backgrounds: on cutout_on_brand_colour use at least 2 background beats (the second a COMPLEMENTARY mid-tone gradient, a warm gold / cream / brocade tone when the brand colour is plum, maroon or wine, never the same hue family as beat 1; luminance 0.15-0.45, from about the middle, at a beat boundary; never near-white), never a still with people, and keep the background's luminance different from the saree so she separates. If a background is dark (luma < 0.2) set subject.rim.enabled true (px >= 2).
 - Hook: stroke width 8, weight "black", keyword = ONE word of the hook to highlight in yellow. The headline must fit above the speaker's head. A callout sits in the side margin (left_mid/right_mid) away from the head with point "shoulder", never over the face.
 - Between beats set segments[i].transition_in (i >= 1) to push (0.25s) or flash (0.15s) or dissolve; subject_scale 1.0 unless the head sizes differ.
 - Caption chunks (only if captions.source is "plan") are 3-6 words and 0.8-2.0 s each; normally keep source "asr".
@@ -1197,7 +1252,7 @@ SHAPE = {
                               "transition_in": {"type": "push", "dur": 0.25}}],
                 "mask": {"prompt": "woman", "feather": 2.0, "edge": [0.35, 0.65]},
                 "transform": {"scale": 1.0, "x": 0, "y": 0}, "shadow": 0.5,
-                "rim": {"enabled": True, "px": 2, "color": "#fff3e0"}},
+                "rim": {"enabled": True, "px": 2, "color": "#e8c9a0", "opacity": 0.35}},
     "background": [{"id": "bg1", "kind": "gradient", "colors": ["#3b0a2a", "#c2410c"], "src": None, "prompt": None,
                     "blur": 0, "zoom": 1.08, "dim": 1.0, "start": 0, "transition_in": {"type": "cut", "dur": 0}},
                    {"id": "bg2", "kind": "gradient", "colors": ["#a3586f", "#d98a5f"], "src": None, "prompt": None,

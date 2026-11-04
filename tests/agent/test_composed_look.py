@@ -2,6 +2,7 @@
 
 No network, synthetic data only. The one real-ffmpeg test (preview stills built from a generated clip) skips when
 ffmpeg is missing."""
+import copy
 import json
 import shutil
 import subprocess
@@ -696,12 +697,12 @@ def test_human_cta_edit_is_kept_verbatim_and_shown():
     run, loop, client, media = _preview_loop([[("preview_composition", {})], [("ask_human", {"summary": "ok"})]],
                                              textile=False)
     media.cta = DIRTY_CTA
-    human(run, "edit", fields={"cta": "Visit dharaa dot com today"})
+    human(run, "edit", fields={"cta": "Visit example dot com today"})
     loop.advance(run)
     tb = Toolbox(run, media.backends())
     cta = next(t for t in tb.plan_rec()["plan"]["text"] if t["role"] == "cta")
-    assert cta["text"] == cta["cta_short"] == "Visit dharaa dot com today"
-    assert next(t for t in media.previews[-1]["text"] if t["role"] == "cta")["text"] == "Visit dharaa dot com today"
+    assert cta["text"] == cta["cta_short"] == "Visit example dot com today"
+    assert next(t for t in media.previews[-1]["text"] if t["role"] == "cta")["text"] == "Visit example dot com today"
 
 
 def test_overlong_human_fields_are_ignored_with_a_reason_and_not_locked():
@@ -898,3 +899,85 @@ def compose_plan_with_size(plan):
     p = json.loads(json.dumps(plan))
     p["size"], p["fps"] = [1080, 1920], 30          # what render_composition sets before it builds the subject chain
     return p
+
+
+# ---------------------------------------------------------------- D3: plan timeline vs master length
+def _plan_with_callout(c):
+    p = compose_plan.default_plan(c)
+    p["text"].append({"id": "callout", "role": "callout", "text": "Perfect for festive", "region": "right_mid", "font": "latin",
+                      "size": 40, "style": "callout_tag", "fill": "#111111", "stroke": None, "plate": "#fbbf24",
+                      "pill_text": None, "rot": 0, "animation": "pop", "weight": "black", "start": 5.0, "end": 8.0, "beat": 1})
+    p = ctools.retime_plan(p, c, [])
+    assert any(t["role"] == "callout" for t in p["text"])
+    return p
+
+
+def test_rescale_stretches_plan_to_master_and_clamps_cta():
+    c = concept()
+    p = _plan_with_callout(c)
+    old = p["duration"]                                    # 14.0: beats + hold
+    call = next(t for t in p["text"] if t["role"] == "callout")
+    s0, e0 = call["start"], call["end"]
+    master = round(old + 2.6, 2)                           # master longer than the plan
+    out = ctools.rescale_to_master(copy.deepcopy(p), master)
+    assert out["duration"] == master and out["meta"]["rescaled"] == {"from": old, "to": master}
+    co = next(t for t in out["text"] if t["role"] == "callout")
+    f = master / old
+    assert co["start"] == pytest.approx(s0 * f, abs=0.02) and co["end"] == pytest.approx(e0 * f, abs=0.02)
+    assert all(t["end"] <= master + 1e-9 for t in out["text"])
+    cta = next(t for t in out["text"] if t["role"] == "cta")
+    assert cta["end"] == master and cta["start"] >= master - ctools.CTA_WINDOW_S - 1e-9
+    assert [b["start"] for b in out["background"]][0] == 0
+    assert out["background"][-1]["start"] > p["background"][-1]["start"]
+
+
+def test_rescale_noop_when_close_and_ignores_unprobed_master():
+    c = concept()
+    p = _plan_with_callout(c)
+    same = ctools.rescale_to_master(copy.deepcopy(p), p["duration"] + 0.01)
+    assert [(t["start"], t["end"]) for t in same["text"] if t["role"] != "cta"] == \
+           [(t["start"], t["end"]) for t in p["text"] if t["role"] != "cta"]
+    assert "rescaled" not in same["meta"]
+    assert ctools.rescale_to_master(copy.deepcopy(p), None)["duration"] == p["duration"]
+    assert ctools.probe_duration("/nonexistent/none.mp4") is None
+
+
+def test_rescale_shrinks_long_cta_window_to_last_three_seconds():
+    c = concept()
+    p = _plan_with_callout(c)
+    cta = next(t for t in p["text"] if t["role"] == "cta")
+    cta["start"] = 2.0
+    out = ctools.rescale_to_master(p, p["duration"])
+    cta = next(t for t in out["text"] if t["role"] == "cta")
+    assert cta["end"] - cta["start"] <= ctools.CTA_WINDOW_S + 1e-9
+
+
+def test_set_subject_luma_records_meta_and_ignores_garbage():
+    p = ctools.set_subject_luma({"meta": {"head": {"top_frac": 0.3}}}, 0.4321)
+    assert p["meta"]["subject"]["luma"] == 0.4321 and p["meta"]["head"]["top_frac"] == 0.3
+    assert "subject" not in ctools.set_subject_luma({}, None).get("meta", {})
+    assert "subject" not in ctools.set_subject_luma({}, 7).get("meta", {})
+    assert ctools.subject_luma("/nonexistent/m.mp4", "/nonexistent/k.mp4") is None
+
+
+# ---------------------------------------------------------------- D8: QC prompt knows the soft end-card pill
+def test_qc_prompt_exempts_onscreen_cta_pill_and_judges_spoken_cta():
+    from adfarming import qc
+    text = qc.PROMPT
+    assert "end-card pill" in text and "BY DESIGN" in text
+    assert "SPOKEN CTA" in text and "discount, price or" in text
+    text.format(brief="b", concept="c", captions="x")      # still a valid template
+
+
+def test_subject_luma_measures_masked_pixels_and_probe_has_duration(tmp_path):
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg missing")
+    master, matte = tmp_path / "m.mp4", tmp_path / "k.mp4"
+    # left half of the frame mid-grey (the subject), right half white; the matte selects only the left half
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=white:s=160x160:d=2:r=10", "-vf",
+                    "drawbox=x=0:y=0:w=80:h=160:color=0x808080:t=fill", "-pix_fmt", "yuv420p", str(master)], check=True, timeout=60)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=160x160:d=2:r=10", "-vf",
+                    "drawbox=x=0:y=0:w=80:h=160:color=white:t=fill", "-pix_fmt", "yuv420p", str(matte)], check=True, timeout=60)
+    assert ctools.probe_duration(master) == pytest.approx(2.0, abs=0.2)
+    lum = ctools.subject_luma(master, matte)
+    assert lum is not None and lum == pytest.approx(compose_plan._lum("#808080"), abs=0.04)   # not the white background

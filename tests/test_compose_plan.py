@@ -476,3 +476,65 @@ def test_keyword_is_a_bare_word_of_the_hook():
     p = good()
     next(t for t in p["text"] if t["role"] == "hook")["keyword"] = "fit?"
     assert next(t for t in cp.repair_plan(p, [], CONCEPT)["text"] if t["role"] == "hook")["keyword"] == "fit"
+
+
+# ---------------------------------------------------------------- D7: complementary beat 2, subject luma, soft rim
+def _hue_of(colors):
+    return [cp._hue(c) for c in colors]
+
+
+def test_beat2_is_complementary_warm_tone_for_maroon_brand():
+    p = cp.default_plan(CONCEPT, ["#6b0f2a", "#8c1a35"])
+    b1, b2 = p["background"][0], p["background"][1]
+    assert not cp._same_family(b1["colors"], b2["colors"])
+    hues = [h for h in _hue_of(b2["colors"]) if h is not None]
+    assert hues and all(20 <= h <= 60 for h in hues)          # gold / cream / brocade
+    assert 0.12 <= cp._bg_luma(b2) <= 0.5                      # mid-tone, never near white
+    assert codes(p) == set()
+
+
+def test_same_hue_family_second_beat_is_linted_and_recoloured():
+    p = good()
+    p["background"][1]["colors"] = [cp._mix_white("#5a1230", 0.3), cp._mix_white("#7a1d3c", 0.3)]
+    assert "bg_complement" in codes(p)
+    fixed = cp.repair_plan(p, [], CONCEPT, assets_info=ASSETS)
+    assert not cp._same_family(fixed["background"][0]["colors"], fixed["background"][1]["colors"])
+    assert "bg_complement" not in codes(fixed)
+
+
+def test_gold_brand_gets_cool_complement():
+    cols = cp.complement_beat(["#c9a24a", "#e0b85c"], 0.2)
+    assert all(not (25 <= h <= 75) for h in _hue_of(cols) if h is not None)
+
+
+def test_bg_contrast_lint_uses_meta_subject_luma():
+    p = good()
+    bright = copy.deepcopy(p)
+    # a light subject against two light backgrounds: no beat separates when the measured luma is passed
+    bright["background"] = [dict(b, colors=["#d9b25f", "#e8cf9a"]) for b in bright["background"]]
+    bright["meta"] = dict(bright.get("meta") or {}, subject={"luma": 0.5})
+    assert "bg_contrast" in codes(bright)
+    # same plan judged against the default dark subject passes: proves the lint reads meta.subject.luma
+    dark = copy.deepcopy(bright)
+    dark["meta"]["subject"] = {}
+    assert "bg_contrast" not in codes(dark)
+
+
+def test_repair_beat2_follows_measured_subject_luma():
+    flat = cp.default_plan(CONCEPT, ["#5a1230", "#a3321f"])
+    flat["background"] = flat["background"][:1]
+    flat["meta"] = dict(flat.get("meta") or {}, subject={"luma": 0.3})
+    fixed = cp.repair_plan(flat, [], CONCEPT)
+    sl = 0.3
+    assert max(cp._lum_contrast(cp._bg_luma(b), sl) for b in fixed["background"]) >= cp.MIN_BG_CONTRAST
+
+
+def test_rim_is_soft_not_a_white_halo():
+    p = good()
+    rim = p["subject"]["rim"]
+    assert rim["enabled"] and rim["opacity"] <= cp.RIM_OPACITY
+    assert rim["color"].lower() not in ("#ffffff", "#fff", "#fff3e0")
+    assert list(VAL.iter_errors(p)) == []
+    loud = copy.deepcopy(p)
+    loud["subject"]["rim"]["opacity"] = 1.0
+    assert cp.repair_plan(loud, [], CONCEPT, assets_info=ASSETS)["subject"]["rim"]["opacity"] <= cp.RIM_OPACITY

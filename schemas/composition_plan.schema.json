@@ -247,6 +247,12 @@
             },
             "color": {
               "$ref": "#/$defs/hex"
+            },
+            "opacity": {
+              "type": "number",
+              "minimum": 0.1,
+              "maximum": 1,
+              "description": "Rim opacity (renderer: default 0.35 when absent); keep soft, no hard white halo."
             }
           }
         }
