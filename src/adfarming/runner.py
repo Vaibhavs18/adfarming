@@ -251,6 +251,23 @@ class StubRunner(AgentRunner):
     FRAMES = ["f1.webp", "f2.webp", "f3.webp"]
     CUTS = {"9x16": "c_9x16.mp4", "1x1": "c_1x1.mp4", "16x9": "c_16x9.mp4"}
     NEXT_COST = {"brief": 0.03, "ideas": 0.12, "preview": 0.20, "edit": 0.06}
+    STUB_LOOK_LABEL = ("These stills use the real speaker, cut out of her footage by SAM, on the planned backgrounds. "
+                       "Backgrounds are brand colours or generated textile plates, never people.")
+
+    @staticmethod
+    def _composed() -> bool:
+        return (os.environ.get("STUDIO_LOOK") or "composed").strip().lower() != "simple"
+
+    def _stub_look(self, steer: str | None) -> dict | None:
+        """Canned composed-look block (shape of docs/API_CONTRACT.md `look`) so the UI can be built against the stub."""
+        if not self._composed():
+            return None
+        return {"summary": ["Look: cutout on textile plate", "Background: brand-colour gradient then generated textile plate",
+                            "Headline: Stub hook (0.0-3.0s)", "Callout: Handloom (3.0-6.0s)",
+                            "Captions: pop-in, word highlight, dark scrim behind"] + ([f"Steer applied: {steer}"] if steer else []),
+                "plan_id": "plan.v2" if steer else "plan.v1", "preset": "cutout_on_textile_plate", "mode": "composed",
+                "label": self.STUB_LOOK_LABEL, "notes": [], "source": "stub",
+                "editable": ["hook", "cta", "title", "callout", "preset"]}
 
     def __init__(self, fixtures_dir: str | os.PathLike | None = None) -> None:
         d = fixtures_dir or os.environ.get("STUDIO_STUB_FIXTURES")
@@ -375,7 +392,10 @@ class StubRunner(AgentRunner):
             gates.assert_approved(run_id, "storyboard")  # code-enforced paid-tool gate
             self._tool(run_id, "muse-image", 0.12, "Drawing storyboard frames (AI stand-ins).")
             frames = [self._put(run_id, n, "webp") for n in self.FRAMES]
-            card = {"type": "preview", "frames": frames, "cost_estimate_usd": self.NEXT_COST["preview"]}
+            card = {"type": "preview", "frames": frames, "cost_estimate_usd": self.NEXT_COST["preview"],
+                    "frames_kind": "composed" if self._composed() else "storyboard",
+                    "look": self._stub_look(steer), "frames_label": self.STUB_LOOK_LABEL if self._composed()
+                    else "AI stand-ins (generated pictures, not the real speaker)"}
         elif step == "edit":
             gates.assert_approved(run_id, "build_cuts")
             self._tool(run_id, "sam-3.1", 0.06, "Building the three cuts.")
@@ -398,7 +418,7 @@ class StubRunner(AgentRunner):
             if steer:
                 hook = f"{hook} ({steer})"
             card = {"type": "edit", "beats": beats, "captions": caps, "hook": hook, "cta": cta,
-                    "cost_estimate_usd": 0.06}
+                    "cost_estimate_usd": 0.06, "look": self._stub_look(steer)}
         elif step == "check":
             self._tool(run_id, "muse-wonder", 0.06, "Checking the cut against the brief.")
             hist = list(prev.get("history") or [])

@@ -18,6 +18,22 @@ function frameSvg(i, label) {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="270" height="480" viewBox="0 0 270 480"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${pal[0]}"/><stop offset="1" stop-color="${pal[1]}"/></linearGradient></defs><rect width="270" height="480" fill="url(#g)"/><g fill="none" stroke="rgba(255,255,255,.35)" stroke-width="3">${[0, 1, 2, 3, 4, 5].map((k) => `<path d="M-10 ${90 + k * 60} Q 70 ${40 + k * 60} 135 ${90 + k * 60} T 280 ${90 + k * 60}"/>`).join('')}</g><text x="135" y="250" font-family="system-ui" font-size="22" font-weight="700" fill="#fff" text-anchor="middle">Frame ${i + 1}</text><text x="135" y="282" font-family="system-ui" font-size="14" fill="#fff" text-anchor="middle">${label}</text></svg>`;
   return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
 }
+// Composed-look stand-ins: a fictional silhouette (no real person) over a plan background, with the planned text.
+const BG = { cutout_on_brand_colour: ['#7a1f3d', '#3b0f26'], cutout_on_textile_plate: ['#8a3a2a', '#4a1d18'], cutout_over_blurred_scene: ['#6b5a7a', '#2f2640'], split_with_pip_card: ['#1f5c4d', '#103a30'] };
+function composedSvg(i, look) {
+  const [a, b] = BG[look.preset] || BG.cutout_on_brand_colour;
+  const plate = look.preset === 'cutout_on_textile_plate' && i > 0;
+  const hook = look.hook.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const call = (look.callout || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="270" height="480" viewBox="0 0 270 480"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${a}"/><stop offset="1" stop-color="${b}"/></linearGradient></defs><rect width="270" height="480" fill="url(#g)"/>${plate ? '<g fill="none" stroke="rgba(255,255,255,.18)" stroke-width="2">' + [0, 1, 2, 3, 4, 5, 6, 7].map((k) => `<path d="M-10 ${40 + k * 55} Q 70 ${10 + k * 55} 135 ${40 + k * 55} T 280 ${40 + k * 55}"/>`).join('') + '</g>' : ''}<ellipse cx="135" cy="190" rx="38" ry="46" fill="#d9b8a0"/><path d="M60 480 C60 330 90 250 135 250 C180 250 210 330 210 480Z" fill="#e8c35a"/><rect x="18" y="38" width="234" height="58" rx="14" fill="rgba(20,10,20,.55)"/><text x="135" y="74" font-family="system-ui" font-size="18" font-weight="700" fill="#fff" text-anchor="middle">${hook.slice(0, 26)}</text>${call ? `<g transform="rotate(-6 60 250)"><rect x="14" y="236" width="104" height="28" rx="6" fill="#f3c969"/><text x="66" y="255" font-family="system-ui" font-size="13" font-weight="700" fill="#3b0f26" text-anchor="middle">${call.slice(0, 16)}</text></g>` : ''}<rect x="14" y="392" width="242" height="46" rx="8" fill="rgba(0,0,0,.6)"/><text x="135" y="421" font-family="system-ui" font-size="15" font-weight="700" fill="#fff" text-anchor="middle">${i === 0 ? 'Saree shaadi mein' : 'handloom ki baat'}</text></svg>`;
+  return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+}
+function lookBlock(run) {
+  const l = run.look;
+  return { summary: ['Look: ' + l.preset.replace(/_/g, ' '), 'Background: ' + (l.preset === 'cutout_on_textile_plate' ? 'brand-colour gradient, then a generated textile plate' : 'brand-colour gradient'), 'Headline: ' + l.hook + ' (0.0-3.0s)', ...(l.callout ? ['Callout: ' + l.callout + ' (3.0-6.0s)'] : []), 'Captions: pop-in, word highlight, dark scrim behind', ...(l.steers.map((t) => 'Steer applied: ' + t))],
+    plan_id: 'plan.v' + (1 + l.steers.length), preset: l.preset, mode: 'composed', label: 'Real speaker cut out over planned backgrounds (fictional demo art)', notes: [], source: 'mock', editable: ['hook', 'cta', 'title', 'callout', 'preset'] };
+}
+function composedFrames(run) { return [0, 1, 2].map((i) => composedSvg(i, run.look)); }
 const FRAME_LABELS = ['Placeholder: loom', 'Placeholder: hands', 'Placeholder: drape', 'Placeholder: end card'];
 
 function emit(runId, name, data) {
@@ -52,10 +68,11 @@ function cardFor(run) {
   const step = run.current_step;
   if (step === 'brief') return { type: 'brief', text: run.briefText, memory_cited: FX.memory_cited_brief, cost_estimate_usd: COSTS.brief };
   if (step === 'ideas') return { type: 'ideas', concepts: run.concepts, recommended: 'c2', cost_estimate_usd: COSTS.ideas };
-  if (step === 'preview') return { type: 'preview', frames: run.frames, cost_estimate_usd: COSTS.preview };
+  if (step === 'preview' && run.composed) return { type: 'preview', frames: composedFrames(run), frames_kind: 'composed', frames_label: 'Real speaker cut out over the planned backgrounds (fictional demo art)', look: lookBlock(run), summary: 'Composed preview', cost_estimate_usd: 0.31, cost_items: [{ what: 'Speaker cut-out for the full video (SAM)', usd: 0.04 }, { what: 'Render the composed 9:16 and derive 1:1 and 16:9', usd: 0.02 }, { what: 'Quality check (Wonder)', usd: 0.25 }] };
+  if (step === 'preview') return { type: 'preview', frames: run.frames, frames_kind: 'storyboard', frames_label: 'AI stand-ins, not your footage', look: null, cost_estimate_usd: COSTS.preview };
   if (step === 'edit') {
     const c = chosen(run);
-    return { type: 'edit', beats: c.beats, captions: run.captions, hook: c.hook, cta: c.cta, cost_estimate_usd: COSTS.edit };
+    return { type: 'edit', beats: c.beats, captions: run.captions, hook: c.hook, cta: c.cta, look: run.composed ? lookBlock(run) : null, cost_estimate_usd: COSTS.edit };
   }
   if (step === 'check') return { type: 'check', verdict: run.qc, history: run.qcHistory, proposed_fixes: run.qc.pass ? [] : run.qc.fixes };
   return { type: 'ship', cuts: run.cuts, zip: 'mock/demo.mp4', memory_proposals: S.memory.filter((m) => m.status === 'proposed') };
@@ -70,7 +87,8 @@ function state(run) {
     steps: stepsFor(run), gate, memory_in_play: inPlay,
     artifacts: {
       concepts: cur >= 1 ? run.concepts : null,
-      frames: cur >= 2 ? run.frames : [],
+      frames: cur >= 2 ? (run.composed ? composedFrames(run) : run.frames) : [],
+      frames_label: null, look: cur >= 2 && run.composed ? lookBlock(run) : null,
       cuts: cur >= 3 ? run.cuts : null,
       captions: cur >= 3 ? run.captions : [],
       qc: cur >= 4 ? run.qc : null,
@@ -105,6 +123,8 @@ function newRun(client_id, goal) {
     captions: JSON.parse(JSON.stringify(FX.captions)),
     cuts: { '9x16': 'mock/demo.mp4', '1x1': 'mock/demo.mp4', '16x9': 'mock/demo.mp4' },
     qc: null, qcHistory: [], steered: false,
+    composed: new URLSearchParams(location.search).get('look') !== 'simple',
+    look: { preset: 'cutout_on_textile_plate', hook: 'Saree shaadi mein pehni', callout: 'Handloom', steers: [] },
   };
   S.runs[run_id] = run;
   logEntry(run, { actor: 'human', kind: 'run_started', text: 'You started a run for Demo Saree Brand' + (goal ? ': ' + goal : '.') });
@@ -135,6 +155,12 @@ async function answer(run, b) {
     if (step === 'ideas' && f.concept_id) {
       const c = run.concepts.find((x) => x.id === f.concept_id);
       if (c) { if (f.hook != null) c.hook = f.hook; if (f.cta != null) c.cta = f.cta; }
+    } else if (step === 'preview' || (step === 'edit' && run.composed)) {
+      const c = chosen(run);
+      if (f.hook != null) { run.look.hook = f.hook; c.hook = f.hook; }
+      if (f.cta != null) c.cta = f.cta;
+      if (f.callout != null) run.look.callout = f.callout;
+      if (f.preset != null && BG[f.preset]) run.look.preset = f.preset;
     } else if (step === 'edit') {
       const c = chosen(run);
       if (f.hook != null) c.hook = f.hook;
@@ -159,6 +185,10 @@ async function answer(run, b) {
     } else if (step === 'check') {
       run.qc = FX.qc_pass; run.qcHistory.push({ attempt: run.qcHistory.length + 1, score: 5, pass: true, summary: FX.qc_pass.summary });
       await goTo(run, 'check', ['Applying your fixes and rebuilding the cuts.', 'Re-checking the new cut.'], 1400, ['muse-wonder', 0.06]);
+    } else if (step === 'preview' && run.composed) {
+      run.look.steers.push(b.text || '');
+      if (/calm|soft|quiet/i.test(b.text || '')) run.look.preset = 'cutout_on_brand_colour';
+      await goTo(run, 'preview', ['Re-planning the look with your note.', 'Redrawing the stills.'], 1000, ['muse-spark', 0.01]);
     } else if (step === 'edit') {
       run.captions[2].start = 3.0;
       await goTo(run, 'edit', ['Moving the caption earlier and rebuilding.'], 1000, ['ffmpeg-cuts', 0.03]);

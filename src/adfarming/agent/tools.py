@@ -28,22 +28,32 @@ from jsonschema import Draft202012Validator
 from .. import trace
 from ..studio import events, gates, memory
 from ..studio.events import STEPS, step_index
+from . import compose_tools
+from .compose_tools import COMPOSE_GATES, COMPOSE_TOOLS, ComposeMixin
+
+# The composed look's paid tools are gated exactly like storyboard/build_cuts. (studio/gates.py owns TOOL_GATES; the
+# composition tools register themselves here so assert_approved, the audit and the blocked-attempt log cover them.)
+gates.TOOL_GATES.update(COMPOSE_GATES)
 
 SPARK_CALL_USD = 0.01          # flat estimate per successful Spark call (token prices unverified)
 MAX_RESULT_CHARS = 4000
 MAX_PROPOSALS = 3
 MEMORY_ALL_IF_AT_MOST = 15
 EST = {"write_concepts": 0.03, "revise_concept": 0.01, "revise_edit": 0.01, "storyboard": 0.04,
-       "build_cuts": 0.20, "review_cut": 0.03, "track_subject": 0.011}
+       "build_cuts": 0.20, "review_cut": 0.03, "track_subject": 0.011,
+       "plan_composition": 0.01, "backdrops": 0.01, "preview_composition": 0.02, "render_composition": 0.10}
+BUILD_CUTS_COMPOSED_EST = 0.03   # composed look: master + simple fallback cuts, no QC and no SAM here
 NEXT_COST = {"brief": 0.03, "ideas": 0.04, "preview": 0.20, "edit": 0.03, "check": 0.0, "ship": 0.0}
 RATIOS = ("9x16", "1x1", "16x9")
 
 STEP_TOOLS: dict[str, list[str]] = {
     "brief": ["read_memory", "ask_human"],
     "ideas": ["read_memory", "write_concepts", "revise_concept", "propose_memory", "ask_human"],
-    "preview": ["read_memory", "storyboard", "ask_human"],
-    "edit": ["read_memory", "build_cuts", "track_subject", "revise_edit", "ask_human"],
-    "check": ["read_memory", "review_cut", "revise_edit", "build_cuts", "ask_human"],
+    "preview": ["read_memory", "plan_composition", "backdrops", "preview_composition", "storyboard", "ask_human"],
+    "edit": ["read_memory", "build_cuts", "render_composition", "plan_composition", "backdrops", "track_subject",
+             "revise_edit", "ask_human"],
+    "check": ["read_memory", "review_cut", "revise_edit", "build_cuts", "render_composition", "plan_composition",
+              "ask_human"],
     "ship": ["read_memory", "propose_memory", "ask_human"],
     "done": ["propose_memory", "finish"],
 }
@@ -100,6 +110,25 @@ SPECS: dict[str, tuple[str, dict]] = {
         {"type": "object", "required": ["steer"], "properties": {
             "steer": {"type": "string"},
             "structured_changes": {"type": "array", "items": {"type": "string"}}, "decision": _DEC}}),
+    "plan_composition": (
+        "Write (or rewrite) the COMPOSITION PLAN for the approved concept: speaker cut out over backgrounds, headline, "
+        "callout, captions, CTA. Cheap (one Spark call), creates a new plan version. Pass the human's steer verbatim "
+        "in guidance. The human's edited hook/cta/title/callout/preset are applied by the system and cannot be overwritten.",
+        {"type": "object", "properties": {"guidance": {"type": "string"}, "decision": _DEC}}),
+    "backdrops": (
+        "PAID. Generate (Muse Image) the background plates the current plan asks for, tinted and dimmed, cached per run. "
+        "Optional prefetch: preview_composition and render_composition make missing plates themselves. Needs the Ideas approval.",
+        {"type": "object", "properties": {"decision": _DEC}}),
+    "preview_composition": (
+        "PAID but cheap. Composed preview stills: SAM cuts out the REAL speaker from each background's midpoint frame, "
+        "the deterministic renderer composites her over the planned backgrounds with the text. Needs the Ideas approval. "
+        "If it fails the old storyboard is drawn instead.",
+        {"type": "object", "properties": {"decision": _DEC}}),
+    "render_composition": (
+        "PAID. Composed final render from the master cut (call build_cuts first): SAM video matte (cached), the 9:16 "
+        "composition, derived 1:1 and 16:9, then QC on the composed 9:16. Needs the Preview approval. If it fails the "
+        "simple cuts are delivered and a fallback is logged.",
+        {"type": "object", "properties": {"subject_prompt": {"type": "string"}, "decision": _DEC}}),
     "finish": ("End the session after the human approved Ship.",
                {"type": "object", "required": ["summary"], "properties": {
                    "summary": {"type": "string"}, "decision": _DEC}}),
@@ -107,10 +136,17 @@ SPECS: dict[str, tuple[str, dict]] = {
 _VALIDATORS = {n: Draft202012Validator(p) for n, (_, p) in SPECS.items()}
 
 
-def tool_schemas(step: str) -> list[dict]:
+def step_tools(step: str, look: str | None = None) -> list[str]:
+    """Tools allowed in `step`; the composition tools disappear when the look is simple (STUDIO_LOOK=simple or a
+    logged fallback)."""
+    look = look or compose_tools.look_mode()
+    return [n for n in STEP_TOOLS[step] if look == "composed" or n not in COMPOSE_TOOLS]
+
+
+def tool_schemas(step: str, look: str | None = None) -> list[dict]:
     """Flat Responses-API function tools allowed in `step`."""
     return [{"type": "function", "name": n, "description": SPECS[n][0], "parameters": SPECS[n][1]}
-            for n in STEP_TOOLS[step]]
+            for n in step_tools(step, look)]
 
 
 # ------------------------------------------------------------------ config
@@ -203,6 +239,7 @@ def _d_propose_rules(steers: list[str]) -> list[dict]:
 
 
 _DEFAULTS: dict[str, Callable] = {
+    **compose_tools.DEFAULTS,
     "load_brief": _d_load_brief, "load_subject": _d_load_subject, "load_refs": _d_load_refs,
     "load_clips": _d_load_clips, "generate": _d_generate, "revise": _d_revise, "frames": _d_frames,
     "build": _d_build, "track": _d_track, "review": _d_review,
@@ -324,7 +361,7 @@ def best_of_rounds(run, concept: dict, clips: list[dict], brief: str, *, build, 
 
 
 # ------------------------------------------------------------------ the toolbox
-class Toolbox:
+class Toolbox(ComposeMixin):
     def __init__(self, run_id: str, backends: Backends | None = None, out: str | Path | None = None):
         self.run_id = run_id
         self.b = backends or Backends()
@@ -335,6 +372,7 @@ class Toolbox:
         self.run = trace.Run(run_id, Path(out) if out else out_dir())
         self.dir: Path = self.run.dir
         self._clips: list[dict] | None = None
+        self._tool_mark = 0
 
     # ---------------- state helpers
     def state(self) -> dict:
@@ -422,6 +460,24 @@ class Toolbox:
             elif r.get("tool") == "muse-spark" and r.get("status") == "ok":
                 usd += SPARK_CALL_USD
         return round(usd, 5)
+
+    def _cost_breakdown(self, mark: int) -> dict[str, float]:
+        """Trace cost since `mark`, grouped by the tool that was billed (sam-3.1-still, muse-image, ...)."""
+        f = self.dir / "trace.jsonl"
+        out: dict[str, float] = {}
+        if not f.exists():
+            return out
+        for line in f.read_text().splitlines()[mark:]:
+            r = json.loads(line)
+            if "cost_usd" in r:
+                u = float(r["cost_usd"])
+            elif r.get("tool") == "muse-spark" and r.get("status") == "ok":
+                u = SPARK_CALL_USD
+            else:
+                continue
+            if u > 0:
+                out[r["tool"]] = round(out.get(r["tool"], 0.0) + u, 5)
+        return out
 
     # ---------------- concepts (ideas) helpers
     def concepts_list(self) -> list[dict]:
@@ -519,18 +575,20 @@ class Toolbox:
             except gates.GateBlocked as e:
                 return self._blocked(name, call_id, str(e), f"call ask_human for the '{gates.TOOL_GATES[name]}' "
                                      "step and wait; do not retry around the gate")
-        if name not in STEP_TOOLS[step]:
+        allowed = step_tools(step, self.look())
+        if name not in allowed:
             if name in gates.TOOL_GATES:
                 self._ev("gate_blocked_attempt", {"tool": name, "call_id": call_id, "reason": f"not allowed in step {step}"})
             return err("not_allowed_in_step", f"{name} is not available in step '{step}'", False,
-                       f"allowed now: {STEP_TOOLS[step]}")
-        est = EST.get(name, 0.0)
+                       f"allowed now: {allowed}")
+        est = self._est(name)
         if est and self.spent() + est > run_cap_usd() + 1e-9:
             return err("cost_cap", f"run cap ${run_cap_usd():.2f} would be exceeded "
                        f"(spent ${self.spent():.2f}, {name} ~${est:.2f})", False,
                        "stop spending: ask_human with what you have")
         self._ev("tool_started", {"tool": name, "call_id": call_id})
         mark, t0 = self._trace_mark(), time.time()
+        self._tool_mark = mark
         try:
             res = getattr(self, f"_t_{name}")(args, call_id)
         except ToolError as e:
@@ -542,11 +600,21 @@ class Toolbox:
                       "retry once with the same arguments, otherwise ask_human")
         usd = self._cost_since(mark)
         if usd > 0:
-            events.record_cost(self.run_id, name, usd)
+            if name in COMPOSE_TOOLS:   # SAM / Image / render are recorded under their own names
+                for tool, u in self._cost_breakdown(mark).items():
+                    events.record_cost(self.run_id, tool, u)
+            else:
+                events.record_cost(self.run_id, name, usd)
         self._ev("tool_done", {"tool": name, "call_id": call_id, "ok": res.ok, "usd": usd,
                                "secs": round(time.time() - t0, 2),
                                **({"error": res.error["code"]} if res.error else {})})
         return res
+
+    def _est(self, name: str) -> float:
+        if name == "build_cuts" and self.look() == "composed":
+            return BUILD_CUTS_COMPOSED_EST
+        dyn = self.est_tool(name) if name in COMPOSE_TOOLS else None
+        return EST.get(name, 0.0) if dyn is None else dyn
 
     def _blocked(self, name: str, call_id: str | None, reason: str, hint: str) -> ToolResult:
         self._ev("gate_blocked_attempt", {"tool": name, "call_id": call_id, "reason": reason})
@@ -606,15 +674,12 @@ class Toolbox:
         return ToolResult(True, {"version": v, "concept_id": old["id"], "hook_before": old.get("hook"),
                                  "hook_after": new.get("hook"), "cta_after": new.get("cta")})
 
-    def _t_storyboard(self, a: dict, call_id) -> ToolResult:
-        st = self.state()
+    def _storyboard_files(self, st: dict) -> list[str]:
         cid = self.selected_concept_id(st)
         concept = next((c for c in self.concepts_list() if c["id"] == cid), None)
         if concept is None:
             raise ToolError("missing_artifact", "no approved concept to storyboard")
         notes = [s["text"] for s in st["steers"] if s["step"] == "preview" and s["text"]]
-        if a.get("style_note"):
-            notes.append(a["style_note"])
         subject = self.b.for_client("load_subject", self.client_id) + (" Style notes from the human: " + "; ".join(notes) if notes else "")
         paths = self.b.frames(self.run, copy.deepcopy(concept), subject)
         names = []
@@ -622,9 +687,16 @@ class Toolbox:
             name = f"frame_{cid}_{i}{Path(p).suffix or '.webp'}"
             shutil.copy2(self.dir / p, self.dir / name)
             names.append(name)
-        self._write("frames.json", {"concept_id": cid, "files": names})
+        self._write("frames.json", {"concept_id": cid, "files": names, "kind": "storyboard"})
         gates.propose_artifact(self.run_id, "preview", "frames", ref="frames.json")
-        return ToolResult(True, {"concept_id": cid, "frames": names})
+        return names
+
+    def _t_storyboard(self, a: dict, call_id) -> ToolResult:
+        st = self.state()
+        if a.get("style_note"):   # kept for the storyboard prompt below via a transient steer-like note
+            st = dict(st, steers=[*st["steers"], {"step": "preview", "text": a["style_note"]}])
+        names = self._storyboard_files(st)
+        return ToolResult(True, {"concept_id": self.selected_concept_id(st), "frames": names})
 
     def _safe_track(self, prompt: str):
         def track(m):
@@ -639,29 +711,35 @@ class Toolbox:
     def _t_build_cuts(self, a: dict, call_id) -> ToolResult:
         st = self.state()
         wc = self.working_concept(st)
-        brief = (self.b.for_client("load_brief", self.client_id) or "").strip() or self.full_brief(st)
-        hard = self._memory_block(hard_only=True)
-        if hard:
-            brief += "\n\nCLIENT HARD RULES (QC must verify):\n" + hard
+        brief = self._qc_brief(st)
+        composed = self.look() == "composed"
+        # composed look: this builds the speech-snapped master and the SIMPLE cuts (the fallback look). QC runs once,
+        # on the composed 9:16, inside render_composition.
+        review = ((lambda run, b, c, caps, vid: {"pass": None, "score": None, "issues": [], "fixes": [],
+                                                  "summary": "QC runs on the composed cut"})
+                  if composed else self.b.review)
         mark0 = self._trace_mark()
         res = best_of_rounds(
-            self.run, self._freeze(wc), self.clips(), brief, build=self.b.build, review=self.b.review,
+            self.run, self._freeze(wc), self.clips(), brief, build=self.b.build, review=review,
             revise=lambda *a, **k: self._freeze(self.b.revise(*a, **k)),
             track=self._safe_track(a.get("subject_prompt") or "woman"),
-            max_rounds=int(a.get("max_rounds") or 3),
+            max_rounds=1 if composed else int(a.get("max_rounds") or 3),
             budget_ok=lambda: self.spent() + self._cost_since(mark0) + 0.10 <= run_cap_usd())
         meta = {k: v for k, v in res["meta"].items() if k != "master"}
         meta.update(qc=res["verdict"], qc_history=res["history"], best_round=res["best_round"],
-                    rounds=res["rounds"], concept_id=wc["id"])
+                    rounds=res["rounds"], concept_id=wc["id"], beats_sig=compose_tools.beats_sig(res["concept"]),
+                    look="pending_compose" if composed else "simple")
         self._write("meta.json", meta)
         self._save_working(st, res["concept"])
         gates.propose_artifact(self.run_id, "edit", "cuts", ref="meta.json")
         gates.propose_artifact(self.run_id, "check", "qc", ref="meta.json")
         q = res["verdict"]
-        return ToolResult(True, {"concept_id": wc["id"], "cuts": meta["cuts"], "rounds": res["rounds"],
-                                 "best_round": res["best_round"],
-                                 "qc": {"pass": q.get("pass"), "score": q.get("score"),
-                                        "issues": q.get("issues", [])[:5], "summary": q.get("summary")}})
+        data = {"concept_id": wc["id"], "cuts": meta["cuts"], "rounds": res["rounds"], "best_round": res["best_round"],
+                "qc": {"pass": q.get("pass"), "score": q.get("score"), "issues": q.get("issues", [])[:5],
+                       "summary": q.get("summary")}}
+        if composed:
+            data["next"] = "call render_composition (composed look), then ask_human; these cuts are the fallback"
+        return ToolResult(True, data)
 
     def _t_track_subject(self, a: dict, call_id) -> ToolResult:
         master = self.dir / "work" / "master_hold.mp4"
@@ -676,8 +754,7 @@ class Toolbox:
         meta = self._read("meta.json")
         if not meta or not self._art_ok(st, "cuts"):
             raise ToolError("missing_artifact", "no current cut to review", False, "call build_cuts first")
-        brief = (self.b.for_client("load_brief", self.client_id) or "").strip() or self.full_brief(st)
-        v = self.b.review(self.run, brief, self.working_concept(st), meta["captions"],
+        v = self.b.review(self.run, self._qc_brief(st), self.working_concept(st), meta["captions"],
                           self.dir / meta["cuts"]["9x16"])
         meta["qc"] = v
         meta["qc_history"] = meta.get("qc_history", []) + [{
@@ -748,6 +825,11 @@ class Toolbox:
                            and e["id"] > sid for e in evs):
             tool = {"ideas": "write_concepts or revise_concept", "preview": "storyboard",
                     "edit": "revise_edit then build_cuts", "check": "revise_edit then build_cuts"}[step]
+            if self.look() == "composed" and step == "preview":
+                tool = "plan_composition (with the steer verbatim) then preview_composition"
+            elif self.look() == "composed" and step in ("edit", "check"):
+                tool = ("plan_composition then render_composition for a look steer (background, text, colours), "
+                        "or revise_edit, build_cuts, render_composition for a content steer")
             raise ToolError("steer_not_applied", "the human steered and nothing was produced since: a steer is "
                             "never approval", True, f"apply the steer with {tool}, then call ask_human again")
 
@@ -758,12 +840,18 @@ class Toolbox:
         return [{"id": c["id"], "title": c.get("title"), "angle": c.get("angle"), "hook": c.get("hook"),
                  "cta": c.get("cta"), "length_s": c.get("length_s"), "beats": len(c.get("beats", []))} for c in cs]
 
+    def _next_cost(self, step: str, st: dict) -> tuple[float, list[dict] | None]:
+        usd, items = self.next_cost(step, st)
+        return (NEXT_COST[step], None) if usd is None else (usd, items)
+
     def _card(self, step: str, st: dict, summary: str, refs: list[str], rec: str | None) -> dict:
-        cost = NEXT_COST[step]
+        cost, cost_items = self._next_cost(step, st)
+        extra = {"cost_items": cost_items} if cost_items else {}
         req = self.REQUIRED_ARTIFACT.get(step)
+        composed = self.look() == "composed"
         if req and not self._art_ok(st, req):
-            tool = {"ideas": "write_concepts", "preview": "storyboard", "edit": "build_cuts",
-                    "check": "build_cuts"}[step]
+            tool = {"ideas": "write_concepts", "preview": "plan_composition, then preview_composition" if composed
+                    else "storyboard", "edit": "build_cuts", "check": "build_cuts"}[step]
             raise ToolError("missing_artifact", f"nothing to show for step '{step}' yet", True,
                             f"call {tool} first")
         if step == "brief":
@@ -777,24 +865,42 @@ class Toolbox:
             cs = self.concepts_list()
             rec = rec if rec in {c["id"] for c in cs} else None
             return {"type": "ideas", "concepts": cs, "recommended": rec, "summary": summary,
-                    "memory_cited": refs, "cost_estimate_usd": cost}
+                    "memory_cited": refs, "cost_estimate_usd": cost, **extra}
         if step == "preview":
             fr = self._read("frames.json", {"files": []})
-            return {"type": "preview", "frames": self._urls(fr["files"]), "summary": summary,
-                    "cost_estimate_usd": cost}
+            card = {"type": "preview", "frames": self._urls(fr["files"]), "summary": summary,
+                    "cost_estimate_usd": cost, **extra, "frames_kind": fr.get("kind") or "storyboard",
+                    "look": None, "frames_label": "AI stand-ins (generated pictures, not the real speaker)"}
+            if composed and fr.get("kind") == "composed":
+                pr = self.plan_current(st)
+                if pr is None or pr["id"] != fr.get("plan_id"):
+                    raise ToolError("frames_outdated", "the plan changed after these stills were made", True,
+                                    "call preview_composition to re-render the stills, then ask_human")
+                card["look"] = {**self.look_card(st), "notes": fr.get("notes") or []}
+                card["frames_label"] = card["look"]["label"]
+            return card
         meta = self._read("meta.json") or {}
+        mode = meta.get("look") or "simple"
+        if step in ("edit", "check") and composed and mode == "pending_compose":
+            raise ToolError("missing_artifact", "the composed render has not run yet", True,
+                            "call render_composition first (build_cuts only made the master and the fallback cuts)")
+        look = None
+        if mode in ("composed", "simple_fallback") and step in ("edit", "check"):
+            look = (self.look_card(st, mode) if mode == "composed" else
+                    {"mode": mode, "summary": [], "plan_id": None, "label": "Composition failed: simple cuts delivered.",
+                     "reason": meta.get("fallback_reason"), "editable": []})
         if step == "edit":
             wc = self.working_concept(st)
             return {"type": "edit", "beats": wc.get("beats", []), "captions": meta.get("captions", []),
                     "hook": wc.get("hook"), "cta": wc.get("cta"),
                     "cuts": {r: artifact_url(self.run_id, n) for r, n in meta.get("cuts", {}).items()},
-                    "summary": summary, "cost_estimate_usd": cost}
+                    "summary": summary, "cost_estimate_usd": cost, "look": look}
         if step == "check":
             q = meta.get("qc") or {}
             return {"type": "check", "verdict": q, "history": meta.get("qc_history", []),
                     "proposed_fixes": q.get("fixes", []),
                     "cuts": {r: artifact_url(self.run_id, n) for r, n in meta.get("cuts", {}).items()},
-                    "summary": summary, "cost_estimate_usd": cost}
+                    "summary": summary, "cost_estimate_usd": cost, "look": look}
         zname = self._package(meta)
         props = [{k: i[k] for k in ("id", "kind", "text", "source", "status", "pinned", "evidence", "created_at")}
                  for i in memory.list_memory(self.client_id, "proposed")]
@@ -862,13 +968,17 @@ class Toolbox:
 
     def _apply_edit(self, step: str, payload: dict, st: dict, gate_id: int = 0) -> dict:
         fields = dict(payload.get("fields") or {})
+        for alias, canon in compose_tools.FIELD_ALIASES.items():   # headline -> hook, look_preset -> preset, ...
+            if alias in fields and canon not in fields:
+                fields[canon] = fields.pop(alias)
         applied, ignored = [], []
+        note_next = "Ask_human again."
         if step == "brief":
             if fields.get("text"):
                 self._ev("brief_text", {"text": str(fields["text"])}, "human")
                 applied.append("text")
             ignored += [k for k in fields if k != "text"]
-        elif step in ("ideas", "edit"):
+        elif step in ("ideas", "edit", "preview"):
             def put(c: dict) -> None:
                 locked = {}
                 for k in ("hook", "cta", "title"):
@@ -889,19 +999,37 @@ class Toolbox:
                 if target is not None:
                     put(target)
                     self._save_concepts(cs, st, actor="system")
+                ignored += [k for k in fields if k not in ("hook", "cta", "title", "captions", "concept_id")]
             else:
                 wc = self.working_concept(st)
                 put(wc)
                 self._save_working(st, wc)
-                self._stale([("cuts", "edit"), ("qc", "check")])
+                composed = self.look() == "composed"
+                if composed:
+                    pa, pi = self.apply_plan_edits(step, fields, st)   # callout text + look preset, locked in code
+                    applied += pa
+                    ignored += pi
+                if step == "edit":
+                    self._stale([("cuts", "edit"), ("qc", "check")])
+                    note_next = ("Re-render with render_composition (the master is reused; build_cuts only if the "
+                                 "beats changed), then ask_human." if composed else
+                                 "Rebuild with build_cuts, then ask_human.")
+                else:
+                    if composed and applied:
+                        pid = self.replan_by_code(st)   # new plan version by code, frames go stale
+                        if pid:
+                            note_next = (f"The plan was updated by the system to {pid}. Re-render the stills with "
+                                         "preview_composition, then ask_human.")
+                    elif not composed:
+                        note_next = "Ask_human again."
                 if "captions" in fields:
                     ignored.append("captions (burned-in captions are generated from speech; edit is not applied)")
-            ignored += [k for k in fields if k not in ("hook", "cta", "title", "captions", "concept_id")]
+                ignored += [k for k in fields if k not in ("hook", "cta", "title", "captions", "concept_id", "callout", "preset")
+                            or (k in ("callout", "preset") and not composed)]
         else:
             ignored += list(fields)
         return {"fields": _trim(fields, 300), "applied": sorted(set(applied)), "ignored": ignored,
-                "note": "The human edited these fields. Treat them as final; do not overwrite them. "
-                        + ("Rebuild with build_cuts, then ask_human." if step == "edit" else "Ask_human again.")}
+                "note": "The human edited these fields. Treat them as final; do not overwrite them. " + note_next}
 
 
 def _ts(t: float) -> str:

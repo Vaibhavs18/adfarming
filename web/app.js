@@ -15,6 +15,13 @@ const STATUS = {
   done: ['Done', 'done'], error: ['Error', 'err'], cancelled: ['Cancelled', ''],
 };
 const REJECT_REASONS = [['off-brand', 'Off-brand'], ['wrong moment', 'Wrong moment'], ['wrong tone', 'Wrong tone'], ['other', 'Other']];
+const PRESETS = [
+  ['cutout_on_brand_colour', 'Brand colour (safest)', true],
+  ['cutout_on_textile_plate', 'Textile plate (generated, paid)', true],
+  ['cutout_over_blurred_scene', 'Blurred scene (needs client photos)', false],
+  ['split_with_pip_card', 'Picture card (needs client photos)', false],
+];
+const PRESET_NAME = Object.fromEntries(PRESETS.map(([k, l]) => [k, l]));
 const usd = (n) => '$' + Number(n || 0).toFixed(2);
 const short = (s, n = 40) => (s && s.length > n ? s.slice(0, n - 1) + '…' : s || '');
 
@@ -260,14 +267,63 @@ function IdeasCard({ card, act, busy, memById }) {
     <${Actions}><${BackBtn} step="ideas" act=${act} busy=${busy} /><//></article>`;
 }
 
+// Pull the current text of a plan bullet like "Headline: Foo (0.0-3.0s)" so the edit form can start from it.
+function bulletText(look, label) {
+  const b = ((look && look.summary) || []).find((x) => x.toLowerCase().startsWith(label.toLowerCase() + ':'));
+  if (!b) return '';
+  return b.slice(label.length + 1).replace(/\s*\([^)]*\)\s*$/, '').trim();
+}
+
+function LookPanel({ look }) {
+  if (!look || !look.summary || !look.summary.length) return null;
+  return html`<section class="look" aria-label="The look I planned"><div class="lookhead"><h4 style="margin:0">The look</h4>
+    <span class="pill">${PRESET_NAME[look.preset] || look.preset}</span><span class="pill">${look.plan_id}</span></div>
+    <ul>${look.summary.map((b) => html`<li>${b}</li>`)}</ul>
+    ${(look.notes || []).map((n) => html`<p class="warnbox">${n}</p>`)}</section>`;
+}
+
+function FallbackBanner({ look }) {
+  if (!look || look.mode !== 'simple_fallback') return null;
+  return html`<p class="warnbox" role="status">The composed look could not be made${look.reason ? ' (' + String(look.reason).replace(/_/g, ' ') + ')' : ''}, so this is the simple talking-head cut. Nothing is lost; steer to try again.</p>`;
+}
+
+// Edit form shared by the Preview and Edit cards. Sends only the fields that changed.
+function LookEditor({ look, base, act, busy, withCta, onClose }) {
+  const init = { hook: base.hook ?? bulletText(look, 'Headline'), callout: bulletText(look, 'Callout'), cta: base.cta ?? '', preset: (look && look.preset) || PRESETS[0][0] };
+  const [v, setV] = useState(init);
+  const set = (k) => (e) => setV({ ...v, [k]: e.target.value });
+  const diff = {};
+  Object.keys(init).forEach((k) => { if (!withCta && k === 'cta') return; if (v[k] !== init[k]) diff[k] = v[k]; });
+  return html`<form class="editbox" onSubmit=${async (e) => { e.preventDefault(); if (await act({ action: 'edit', fields: diff })) onClose(); }}>
+    <div class="field-row"><div><label class="f" for="le-hook">Headline (your text is final)</label><input id="le-hook" type="text" value=${v.hook} onInput=${set('hook')} /></div>
+    <div><label class="f" for="le-callout">Callout tag (empty removes it)</label><input id="le-callout" type="text" value=${v.callout} onInput=${set('callout')} /></div></div>
+    <div class="field-row"><div><label class="f" for="le-preset">Background</label><select id="le-preset" value=${v.preset} onChange=${set('preset')}>
+      ${PRESETS.map(([k, l, ok]) => html`<option value=${k} selected=${v.preset === k} disabled=${!ok && k !== init.preset}>${l}</option>`)}</select></div>
+    ${withCta && html`<div><label class="f" for="le-cta">Call to action</label><input id="le-cta" type="text" value=${v.cta} placeholder=${init.cta ? '' : 'Leave empty to keep the current one'} onInput=${set('cta')} /></div>`}</div>
+    <div class="actions"><button class="btn primary" type="submit" disabled=${busy || !Object.keys(diff).length}>Save and redraw</button><button class="btn ghost" type="button" onClick=${onClose}>Cancel</button></div></form>`;
+}
+
 function PreviewCard({ card, act, busy }) {
-  return html`<article class="card"><h2><span class="step">3</span>Storyboard preview</h2>
-    <p class="lead">Rough frames for the chosen idea. If it looks off, steer before we pay for the real cuts.</p>
-    <div class="frames">${card.frames.map((f, i) => html`<figure><img src=${f} alt=${'Storyboard frame ' + (i + 1)} loading="lazy" /><figcaption>Frame ${i + 1}</figcaption></figure>`)}</div>
+  const [editing, setEditing] = useState(false);
+  const composed = card.frames_kind === 'composed' && card.look;
+  const steerHint = () => window.dispatchEvent(new CustomEvent('prefill-steer', { detail: 'Calmer background, ' }));
+  const next = card.cost_items && card.cost_items.length
+    ? html`<details class="costitems"><summary>Next step builds all three video sizes and checks them: about ${usd(card.cost_estimate_usd)} (see what it pays for)</summary><ul>${card.cost_items.map((i) => html`<li>${i.what}: ${usd(i.usd)}</li>`)}</ul></details>`
+    : card.cost_estimate_usd > 0 && html`<p class="mut sm">Next step builds all three video sizes and checks them: about ${usd(card.cost_estimate_usd)}.</p>`;
+  return html`<article class="card"><h2><span class="step">3</span>${composed ? 'Look preview' : 'Storyboard preview'}</h2>
+    <p class="lead">${composed
+      ? 'Stills of the real speaker cut out over the planned backgrounds, with the planned text. Cheap to redo: steer or edit until it looks right, then approve to render the video.'
+      : 'Rough frames for the chosen idea. If it looks off, steer before we pay for the real cuts.'}</p>
+    ${card.frames_label && html`<p class="mut sm framelabel">${card.frames_label}</p>`}
+    <div class=${'frames' + (composed ? ' composed' : '')}>${card.frames.map((f, i) => html`<figure><img src=${f} alt=${(composed ? 'Composed still ' : 'Storyboard frame ') + (i + 1)} loading="lazy" /><figcaption>${composed ? 'Still' : 'Frame'} ${i + 1}</figcaption></figure>`)}</div>
+    ${composed && html`<${LookPanel} look=${card.look} />`}
+    ${editing && composed && html`<${LookEditor} look=${card.look} base=${{}} act=${act} busy=${busy} withCta=${true} onClose=${() => setEditing(false)} />`}
     <${Actions}>
-      <button class="btn primary" disabled=${busy} onClick=${() => act({ action: 'approve' })}>${approveLabel('Approve', card.cost_estimate_usd)}</button>
+      <button class="btn primary" disabled=${busy || editing} onClick=${() => act({ action: 'approve' })}>${approveLabel('Approve', card.cost_estimate_usd)}</button>
+      ${composed && html`<button class="btn" disabled=${busy} onClick=${steerHint}>Steer</button><button class="btn" disabled=${busy || editing} onClick=${() => setEditing(true)}>Edit</button>`}
       <${BackBtn} step="preview" act=${act} busy=${busy} /><//>
-    ${card.cost_estimate_usd > 0 && html`<p class="mut sm">Next step builds all three video sizes and checks them: about ${usd(card.cost_estimate_usd)}.</p>`}</article>`;
+    ${next}
+    ${composed && html`<p class="mut sm">Steer in your own words (for example “calmer background” or “bigger headline”) using the Steer box.</p>`}</article>`;
 }
 
 function CutTabs({ cuts }) {
@@ -279,6 +335,11 @@ function CutTabs({ cuts }) {
     <video key=${cur} class=${'vid r' + cur.replace('x', '')} controls playsinline preload="metadata" src=${cuts[cur]} aria-label=${'Cut at ' + cur.replace('x', ':')}></video></div>`;
 }
 
+function CutGrid({ cuts }) {
+  const keys = ['9x16', '1x1', '16x9'].filter((k) => cuts && cuts[k]);
+  return html`<div class="cutgrid">${keys.map((k) => html`<figure><video class=${'vid r' + k.replace('x', '')} controls playsinline preload="metadata" src=${cuts[k]} aria-label=${'Composed cut at ' + k.replace('x', ':')}></video><figcaption>${k.replace('x', ':')}</figcaption></figure>`)}</div>`;
+}
+
 function EditCard({ card, run, act, busy }) {
   const [hook, setHook] = useState(card.hook);
   const [cta, setCta] = useState(card.cta);
@@ -288,9 +349,14 @@ function EditCard({ card, run, act, busy }) {
   // Caption text is generated from speech and cannot be overridden by the backend: only hook/cta edits are sent.
   const save = () => act({ action: 'edit', fields: { hook, cta } });
   const cuts = run.artifacts && run.artifacts.cuts;
+  const [lookEdit, setLookEdit] = useState(false);
+  const composed = card.look && card.look.mode === 'composed';
   return html`<article class="card"><h2><span class="step">4</span>Edit the cut</h2>
+    <${FallbackBanner} look=${card.look} />
     <p class="lead">Edit the hook or call to action by hand; your edits are final. Caption words come from the speech, so to change one, use Steer instead of typing over it.</p>
-    ${cuts && html`<${CutTabs} cuts=${cuts} />`}
+    ${cuts && (composed ? html`<${CutGrid} cuts=${cuts} />` : html`<${CutTabs} cuts=${cuts} />`)}
+    ${composed && html`<${LookPanel} look=${card.look} /><p><button class="btn sm" disabled=${busy} onClick=${() => setLookEdit(!lookEdit)} aria-expanded=${lookEdit}>Edit the look</button></p>
+      ${lookEdit && html`<${LookEditor} look=${card.look} base=${{ hook: card.hook, cta: card.cta }} act=${act} busy=${busy} withCta=${true} onClose=${() => setLookEdit(false)} />`}`}
     <div class="field-row"><div><label class="f" for="eh">Hook</label><input id="eh" type="text" value=${hook} onInput=${(e) => setHook(e.target.value)} /></div>
     <div><label class="f" for="ec">Call to action</label><input id="ec" type="text" value=${cta} onInput=${(e) => setCta(e.target.value)} /></div></div>
     ${banned && html`<p class="warnbox" role="alert">Heads up: “${banned[0]}” breaks the client's no-hard-sell rule.</p>`}
@@ -326,9 +392,10 @@ function CheckCard({ card, run, act, busy }) {
   const cuts = run.artifacts && run.artifacts.cuts;
   return html`<article class="card"><h2><span class="step">5</span>Quality check</h2>
     <p class="lead">I watched the cut the way a client would.</p>
+    <${FallbackBanner} look=${card.look} />
     <${Verdict} v=${card.verdict} />
     ${card.history && card.history.length > 1 && html`<div class="hist">${card.history.map((hh) => html`<span class=${'pill ' + (hh.pass ? 'ok' : 'bad')}>Try ${hh.attempt}: ${hh.score}/5</span>`)}</div>`}
-    ${cuts && html`<details><summary class="btn sm ghost" style="display:inline-flex">Watch the cut</summary><${CutTabs} cuts=${cuts} /></details>`}
+    ${cuts && html`<details open=${!!(card.look && card.look.mode === 'composed')}><summary class="btn sm ghost" style="display:inline-flex">Watch the cut</summary>${card.look && card.look.mode === 'composed' ? html`<${CutGrid} cuts=${cuts} />` : html`<${CutTabs} cuts=${cuts} />`}</details>`}
     ${fixes.length > 0 && html`<h4 style="margin-top:14px">Suggested fixes (tick the ones to apply)</h4><div class="fixes">${fixes.map((f, i) => html`<label><input type="checkbox" checked=${sel[i]} onChange=${(e) => setSel(sel.map((x, j) => (j === i ? e.target.checked : x)))} /><span>${f}</span></label>`)}</div>`}
     <${Actions}>
       ${fixes.length > 0 && html`<button class="btn primary" disabled=${busy || !chosen.length} onClick=${() => act({ action: 'steer', text: 'Apply these fixes: ' + chosen.join(' ') })}>Steer: apply ${chosen.length} fix${chosen.length === 1 ? '' : 'es'}</button>`}

@@ -370,6 +370,8 @@ def _state(run: dict) -> dict:
     arts = {
         "concepts": ideas.get("concepts") if ideas else None,
         "frames": (prev or {}).get("frames", []),
+        "frames_label": (prev or {}).get("frames_label"),
+        "look": (prev or {}).get("look") if not (edit and edit.get("look")) else edit["look"],
         "cuts": (ship or {}).get("cuts") if ship else ((edit or {}).get("cuts") or _cuts_if_present(rid, edit)),
         "captions": (edit or {}).get("captions", []),
         "qc": ({**chk["verdict"]} if chk else None),
@@ -608,6 +610,8 @@ def _render(e: dict) -> tuple[str | None, str, float | None, list[str]] | None:
         t = f"Run is now {p.get('status')}"
     elif k == "error":
         t = f"Error: {p.get('message')}"
+    elif k == "fallback":
+        t = f"Fell back from {p.get('from')} to {p.get('to')}: {p.get('reason')}"
     else:
         return None
     return step, t, cost, mids

@@ -55,6 +55,7 @@ export STUDIO_PASSWORD='choose-one' STUDIO_SECRET="$(openssl rand -hex 32)" STUD
 # open http://localhost:8000
 ```
 
+- `STUDIO_LOOK=composed` (default) or `simple` picks the reel look; in the browser demo add `&look=simple` to `?mock=1` for the old cards.
 - `STUDIO_RUNNER=stub` is a scripted fake: nothing is spent, no keys needed. `STUDIO_RUNNER=real` uses the real agent and the paid model APIs, so it needs the keys in `deploy/.env.example` (names only; put values in a local `.env`, never commit it).
 - Other settings, all listed in `deploy/.env.example`: `STUDIO_AGENT`, `STUDIO_RUN_CAP_USD`, `STUDIO_DAILY_CAP_USD`, `STUDIO_CLIENT_ID`, `STUDIO_CLIENT_NAME`, `STUDIO_MEMORY_SEED`, `ADFARMING_DB`, `ADFARMING_OUT`.
 - Tests: `.venv/bin/python -m pytest -q` (no network, no keys).
@@ -67,8 +68,8 @@ One VM with Docker Compose, HTTPS and a password gate: follow `deploy/README.md`
 ## What is inside
 
 1. **Concept engine** (Muse Spark): brief + client memory -> three concepts with real cut points taken from the footage's transcript.
-2. **Storyboard preview** (Muse Image): frames the client approves before any video is built.
-3. **Cuts** (ffmpeg, SAM 3.1, Muse Voice Transcribe): 9:16 / 1:1 / 16:9 with the speaker kept in frame and Hinglish captions.
+2. **Look preview** (Spark plan, SAM 3.1 still cut-out, Muse Image plate): stills of the real speaker cut out over planned backgrounds, with stylised text, which the client approves (steers, edits) before any video is rendered. `STUDIO_LOOK=simple` keeps the old Muse Image storyboard and the plain talking-head cut as the fallback look.
+3. **Composed cuts** (ffmpeg, SAM 3.1 video matte, Muse Voice Transcribe): 9:16 / 1:1 / 16:9 with the speaker cut out over changing backgrounds and Hinglish captions; the simple talking-head cut is built too and is the fallback.
 4. **Quality check** (Muse Wonder): scores the cut and proposes fixes; the best round is delivered.
 5. **Agent and memory** (`src/adfarming/agent`, `studio`): one step at a time, paid tools only after a human gate, a hard spend cap, and a decision log of every step (schemas in `schemas/`).
 

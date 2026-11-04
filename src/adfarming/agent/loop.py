@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from ..studio import events
 from . import prompts
+from . import compose_tools
 from .tools import Backends, Toolbox, run_cap_usd, tool_schemas
 
 PRICE_IN, PRICE_OUT = 4 / 1e6, 20 / 1e6   # muse-wonder-1.0 $/token (task brief; unverified vs billing)
@@ -102,7 +103,7 @@ def run_tool_loop(client, tb: Toolbox, step: str, user_text: str, *, max_turns: 
     """One step turn: tools of this step offered every turn; ends when ask_human/finish succeeds."""
     res = LoopResult("cap", "wonder")
     t0 = time.time()
-    tools = tool_schemas(step)
+    tools = tool_schemas(step, tb.look())
     system = system or prompts.system_prompt(tb.client_id)
     history: list[dict] = [_msg(user_text)]      # in-step transcript, for stateless replay
     next_input: list[dict] = list(history)
@@ -226,11 +227,19 @@ def artifact_summaries(tb: Toolbox, st: dict) -> dict:
         except Exception:
             pass
     if tb._art_ok(st, "frames"):
-        out["frames"] = len((tb._read("frames.json") or {}).get("files", []))
+        fr = tb._read("frames.json") or {}
+        out["frames"] = len(fr.get("files", []))
+        out["frames_kind"] = fr.get("kind") or "storyboard"
+    out["look"] = tb.look()
+    pr = tb.plan_rec() if tb.look() == "composed" else None
+    if pr:
+        from .. import compose_plan
+        out["plan"] = {"id": pr["id"], "preset": pr["plan"].get("preset"), "current": tb.plan_current(st) is not None,
+                       "summary": compose_plan.plan_summary(pr["plan"])[:8], "human_locks": tb.plan_locks()}
     if tb._art_ok(st, "cuts"):
         m = tb._read("meta.json") or {}
         q = m.get("qc") or {}
-        out["cuts"] = {"formats": list(m.get("cuts", {})), "rounds": m.get("rounds"),
+        out["cuts"] = {"formats": list(m.get("cuts", {})), "rounds": m.get("rounds"), "look": m.get("look"),
                        "qc": {"pass": q.get("pass"), "score": q.get("score"), "issues": q.get("issues", [])[:4],
                               "summary": q.get("summary")}}
     if stale:
@@ -310,6 +319,38 @@ class ScriptedDriver:
         except Exception:
             return {"concept_id": None, "guidance": text}
 
+
+    # -- composed look
+    def _next_preview_composed(self, tb: Toolbox, st: dict, evs: list[dict], sid, text: str, refs, d) -> tuple[str, dict]:
+        plan_ok = tb.plan_current(st) is not None
+        steer_pending = sid is not None and not self._newer(evs, "artifact_proposed", sid, "plan")
+        if not plan_ok or steer_pending:
+            return "plan_composition", ({"guidance": text, **d} if text else dict(d))
+        fr = tb._read("frames.json") or {}
+        frames_ok = tb._art_ok(st, "frames") and (fr.get("kind") != "composed" or fr.get("plan_id") == tb.plan_rec()["id"])
+        if not frames_ok:
+            return "preview_composition", dict(d)
+        return "ask_human", {"summary": "Composed look preview: the real speaker cut out over the planned backgrounds "
+                                        "with the headline, callout, captions and CTA.", "memory_refs": refs, **d}
+
+    def _next_edit_composed(self, tb: Toolbox, st: dict, evs: list[dict], sid, text: str, refs, d) -> tuple[str, dict]:
+        meta = tb._read("meta.json") or {}
+        cuts_ok = tb._art_ok(st, "cuts")
+        cuts_new = sid is None or self._newer(evs, "artifact_proposed", sid, "cuts")
+        if sid is not None and not cuts_new:
+            if compose_tools.is_look_steer(text):
+                if not self._newer(evs, "artifact_proposed", sid, "edit_plan"):
+                    return "plan_composition", {"guidance": text, **d}
+            elif not self._newer(evs, "concept_revised", sid):
+                it = self._interpret(tb, "edit", text, [])
+                return "revise_edit", {"steer": it["guidance"], **d}
+        pending = meta.get("look") == "pending_compose"
+        if not cuts_ok or not cuts_new or pending:
+            return ("render_composition" if tb.master_fresh(st) else "build_cuts"), dict(d)
+        q = meta.get("qc") or {}
+        return "ask_human", {"summary": f"Composed cut ({meta.get('look')}). QC: {q.get('summary') or 'no verdict'} "
+                                        f"(score {q.get('score')}).", "memory_refs": refs, **d}
+
     def _next(self, tb: Toolbox, st: dict, evs: list[dict], step: str) -> tuple[str, dict]:
         refs = [m["id"] for m in tb.approved_memory() if m["kind"] == "hard_rule"][:4]
         sid, text = self._last_steer(evs, step)
@@ -332,11 +373,16 @@ class ScriptedDriver:
             cs = tb.concepts_list()
             return "ask_human", {"summary": f"{len(cs)} concepts: " + "; ".join(f"{c['id']} {c.get('title')}" for c in cs),
                                  "recommendation": cs[0]["id"], "memory_refs": refs, **d}
+        composed = tb.look() == "composed"
+        if step == "preview" and composed:
+            return self._next_preview_composed(tb, st, evs, sid, text, refs, d)
         if step == "preview":
             if not tb._art_ok(st, "frames") or (sid is not None and not self._newer(evs, "artifact_proposed", sid, "frames")):
                 return "storyboard", ({"style_note": text, **d} if text else dict(d))
             return "ask_human", {"summary": "Preview frames (AI stand-ins) for the approved concept.",
                                  "memory_refs": refs, **d}
+        if step in ("edit", "check") and composed:
+            return self._next_edit_composed(tb, st, evs, sid, text, refs, d)
         if step in ("edit", "check"):
             cuts_ok = tb._art_ok(st, "cuts")
             cuts_new = sid is None or self._newer(evs, "artifact_proposed", sid, "cuts")

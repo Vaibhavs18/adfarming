@@ -13,8 +13,13 @@ preview approve -> edit approve -> check approve -> ship approve -> done; then R
 --kill-server-midway   spawns uvicorn itself with the current env, SIGKILLs it (1) right after the brief is
                 approved while the agent works (run must become 'interrupted' and POST /resume must finish it) and
                 (2) while the ideas gate is pending (same gate must come back, answers still work).
+--composed      composed-look flow (STUDIO_LOOK=composed): at Preview checks frames_kind/look, steers once
+                ('make the background calmer'), checks the new plan version, approves; at Edit checks the three
+                composed cuts + look.mode; prints wall seconds per step and fallback events. Also --save-dir DIR
+                downloads the preview stills and the three cuts there. Use a throwaway ADFARMING_DB/OUT.
 --skip-magic    for the stub runner (placeholder bytes are not real mp4s).
-The password is only read from env STUDIO_PASSWORD and never printed.
+NOTE: keep ADFARMING_OUT outside the repo's private/ tree (web.py refuses to serve artifacts under private/, so
+media Range requests 404); use a temp dir. The password is only read from env STUDIO_PASSWORD and never printed.
 """
 import argparse
 import os
@@ -29,6 +34,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 STEER = "shorter hook, no Diwali year"
+LOOK_STEER = "make the background calmer"
 POLL_S, WAIT_S = 3, 900
 
 
@@ -116,6 +122,19 @@ class Server:
                 self.p.kill()
 
 
+def save_files(h: "Human", a, urls: list[str], prefix: str) -> None:
+    if not a.save_dir:
+        return
+    out = Path(a.save_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    for i, u in enumerate(urls):
+        r = h.s.get(a.base + u, timeout=300)
+        if r.status_code == 200:
+            ext = Path(u.split("?")[0]).suffix or ".bin"
+            (out / f"{prefix}_{i}{ext}").write_bytes(r.content)
+            print(f"  saved {prefix}_{i}{ext} ({len(r.content)} bytes)", flush=True)
+
+
 def db_report(rid: str) -> dict:
     """Gate audit + fallback events straight from the studio DB (when ADFARMING_DB is set)."""
     path = os.environ.get("ADFARMING_DB")
@@ -137,6 +156,9 @@ def main() -> None:
     ap.add_argument("--kill-server-midway", action="store_true")
     ap.add_argument("--shapes", action="store_true")
     ap.add_argument("--skip-magic", action="store_true")
+    ap.add_argument("--composed", action="store_true")
+    ap.add_argument("--save-dir", default="")
+    ap.add_argument("--look-steer", default=LOOK_STEER)
     a = ap.parse_args()
     pw = os.environ.get("STUDIO_PASSWORD")
     if not pw:
@@ -209,12 +231,43 @@ def main() -> None:
         pick = st["gate"]["card"]["concepts"][0]["id"]
         h.answer(rid, st, "approve", choice=pick)
 
+        timings: dict[str, float] = {}
+        t_step = time.time()
         for step in ("preview", "edit", "check", "ship"):
             st = h.wait(rid, label=step)
+            timings[step] = round(time.time() - t_step, 1)
             if st["gate"]["step"] != step:
                 fail(f"expected gate {step}, got {st['gate']['step']}")
             if step == "preview" and not st["gate"]["card"]["frames"]:
                 fail("preview card has no frames")
+            if a.composed and step == "preview":
+                card = st["gate"]["card"]
+                if card.get("frames_kind") != "composed" or not card.get("look"):
+                    print(f"  WARNING preview is {card.get('frames_kind')!r} (fell back); look={card.get('look')}", flush=True)
+                else:
+                    print(f"  preview {card['frames_kind']}: {len(card['frames'])} stills, plan {card['look']['plan_id']}, "
+                          f"preset {card['look']['preset']}, next-step ~${card['cost_estimate_usd']}", flush=True)
+                    for b in card["look"]["summary"]:
+                        print(f"    - {b}", flush=True)
+                save_files(h, a, st["gate"]["card"]["frames"], "still")
+                t_step = time.time()
+                h.answer(rid, st, "steer", text=a.look_steer)
+                st = h.wait(rid, after_gate=st["gate"]["id"], label="preview after look steer")
+                timings["preview_steer"] = round(time.time() - t_step, 1)
+                card = st["gate"]["card"]
+                if st["gate"]["step"] != "preview":
+                    fail(f"look steer left the preview step: {st['gate']['step']}")
+                print(f"  after steer: plan {(card.get('look') or {}).get('plan_id')} kind {card.get('frames_kind')}", flush=True)
+                save_files(h, a, card["frames"], "still_steered")
+            if a.composed and step == "edit":
+                card = st["gate"]["card"]
+                lk = card.get("look") or {}
+                cuts0 = (st["artifacts"].get("cuts") or {})
+                print(f"  edit card: look.mode={lk.get('mode')} plan={lk.get('plan_id')} cuts={sorted(cuts0)}", flush=True)
+                if lk.get("mode") != "composed":
+                    print(f"  WARNING edit card is not composed: {lk.get('mode')} reason={lk.get('reason')}", flush=True)
+                save_files(h, a, [cuts0[k] for k in sorted(cuts0)], "cut")
+            t_step = time.time()
             if step == "edit" and a.shapes:
                 card = st["gate"]["card"]
                 caps = [dict(c, text=c["text"] + " X") for c in card["captions"]]
@@ -229,7 +282,10 @@ def main() -> None:
             if step == "ship":
                 print(f"  ship memory proposals: {[m['text'][:80] for m in st['gate']['card']['memory_proposals']]}", flush=True)
             h.answer(rid, st, "approve")
+            t_step = time.time()
+        t_fin = time.time()
         st = h.wait(rid, want=("done",), label="finish")
+        timings["finish"] = round(time.time() - t_fin, 1)
 
         cuts = st["artifacts"]["cuts"] or {}
         if sorted(cuts) != ["16x9", "1x1", "9x16"]:
@@ -258,6 +314,7 @@ def main() -> None:
         if errs:
             print(f"error events: {[e['text'] for e in errs]}")
         rep = db_report(rid)
+        print(f"STEP_WAIT_SECONDS {timings}  (seconds from the previous answer until the next gate was ready)", flush=True)
         print(f"RESULT status={st['status']} wall={time.time() - t0:.0f}s cost=${st['cost']['usd']:.3f} "
               f"cap=${st['cost']['cap_usd']} by_tool={st['cost']['by_tool']} {rep}")
         if rep and rep["audit"]["violations"]:

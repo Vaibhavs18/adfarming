@@ -18,6 +18,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("ADF_PRIVATE", str(tmp_path / "private"))
     monkeypatch.delenv("STUDIO_RUN_CAP_USD", raising=False)
     monkeypatch.delenv("STUDIO_AGENT", raising=False)
+    monkeypatch.setenv("STUDIO_LOOK", "simple")   # the pre-composition behaviour; test_composed_look.py turns it on
     return tmp_path
 
 

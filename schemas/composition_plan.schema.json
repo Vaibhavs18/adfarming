@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "composition_plan.schema.json",
+  "title": "Composition plan v1",
+  "description": "What the renderer executes: speaker cut out over changing backgrounds, stylised text in named regions, an optional PiP card. Written by Muse Spark, linted and repaired by code (adfarming.compose_plan), shown to the human. The model never emits pixel maths: regions, presets and animations are enums the renderer maps to boxes and motion. All times are seconds on the OUTPUT timeline (0..duration).",
+  "type": "object",
+  "required": ["version", "preset", "size", "fps", "duration", "subject", "background", "text", "captions", "overlays"],
+  "additionalProperties": false,
+  "$defs": {
+    "hex": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"},
+    "time": {"type": "number", "minimum": 0, "maximum": 90},
+    "transition": {
+      "type": "object",
+      "required": ["type", "dur"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"enum": ["cut", "fade", "slide_left", "slide_right"]},
+        "dur": {"type": "number", "minimum": 0, "maximum": 1.5}
+      }
+    }
+  },
+  "properties": {
+    "version": {"const": 1},
+    "preset": {"enum": ["cutout_on_brand_colour", "cutout_on_textile_plate", "cutout_over_blurred_scene", "split_with_pip_card"]},
+    "size": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2, "const": [1080, 1920]},
+    "fps": {"enum": [24, 25, 30]},
+    "duration": {"type": "number", "minimum": 3, "maximum": 60},
+    "rationale": {"type": "string", "maxLength": 400},
+    "subject": {
+      "type": "object",
+      "required": ["segments", "mask", "transform", "shadow"],
+      "additionalProperties": false,
+      "properties": {
+        "segments": {
+          "type": "array", "minItems": 1, "maxItems": 12,
+          "description": "One per concept beat, in order; the speaker footage (clip, in/out seconds in the source) cut out by the SAM mask.",
+          "items": {
+            "type": "object",
+            "required": ["beat", "clip", "in", "out"],
+            "additionalProperties": false,
+            "properties": {
+              "beat": {"type": "integer", "minimum": 0},
+              "clip": {"type": "string", "minLength": 1},
+              "in": {"type": "number", "minimum": 0},
+              "out": {"type": "number", "minimum": 0}
+            }
+          }
+        },
+        "mask": {
+          "type": "object",
+          "required": ["prompt", "feather", "edge"],
+          "additionalProperties": false,
+          "properties": {
+            "prompt": {"type": "string", "minLength": 1, "maxLength": 40},
+            "feather": {"type": "number", "minimum": 0, "maximum": 6},
+            "edge": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 1}, "minItems": 2, "maxItems": 2}
+          }
+        },
+        "transform": {
+          "type": "object",
+          "required": ["scale", "x", "y"],
+          "additionalProperties": false,
+          "properties": {
+            "scale": {"type": "number", "minimum": 0.7, "maximum": 1.3},
+            "x": {"type": "number", "minimum": -200, "maximum": 200},
+            "y": {"type": "number", "minimum": -200, "maximum": 200}
+          }
+        },
+        "shadow": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "background": {
+      "type": "array", "minItems": 1, "maxItems": 4,
+      "description": "Backgrounds in time order; the first starts at 0; later ones dissolve in at `start`. Stills (image, blur_still) must be person-free assets from the assets list.",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "colors", "src", "prompt", "blur", "zoom", "dim", "start", "transition_in"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,23}$"},
+          "kind": {"enum": ["gradient", "image", "generated", "blur_still"]},
+          "colors": {"type": "array", "items": {"$ref": "#/$defs/hex"}, "minItems": 1, "maxItems": 3},
+          "src": {"type": ["string", "null"], "maxLength": 200},
+          "prompt": {"type": ["string", "null"], "maxLength": 240},
+          "blur": {"type": "number", "minimum": 0, "maximum": 40},
+          "zoom": {"type": "number", "minimum": 1, "maximum": 1.3},
+          "dim": {"type": "number", "minimum": 0.2, "maximum": 1},
+          "start": {"$ref": "#/$defs/time"},
+          "transition_in": {"$ref": "#/$defs/transition"}
+        },
+        "allOf": [
+          {"if": {"properties": {"kind": {"enum": ["image", "blur_still"]}}}, "then": {"properties": {"src": {"type": "string", "minLength": 1}}}},
+          {"if": {"properties": {"kind": {"const": "generated"}}}, "then": {"properties": {"prompt": {"type": "string", "minLength": 3}}}}
+        ]
+      }
+    },
+    "text": {
+      "type": "array", "maxItems": 5,
+      "description": "Stylised text blocks (not the spoken-word captions). At most 2 text blocks, captions included, are visible at any moment.",
+      "items": {
+        "type": "object",
+        "required": ["id", "role", "text", "region", "font", "size", "style", "fill", "stroke", "plate", "pill_text", "rot", "animation", "start", "end"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,23}$"},
+          "role": {"enum": ["hook", "callout", "cta", "title", "other"]},
+          "text": {"type": "string", "minLength": 1, "maxLength": 80},
+          "region": {"enum": ["top_center", "left_mid", "right_mid", "bottom_caption", "cta_top"]},
+          "font": {"enum": ["devanagari", "latin"]},
+          "size": {"type": "integer", "minimum": 40, "maximum": 160},
+          "style": {"enum": ["pill_headline", "callout_tag", "cta_pill"]},
+          "fill": {"$ref": "#/$defs/hex"},
+          "stroke": {"anyOf": [{"type": "null"}, {"type": "array", "prefixItems": [{"type": "integer", "minimum": 0, "maximum": 14}, {"$ref": "#/$defs/hex"}], "minItems": 2, "maxItems": 2}]},
+          "plate": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hex"}], "description": "Pill/tag background colour behind the text, or null for text straight on the background."},
+          "pill_text": {"type": ["string", "null"], "maxLength": 18, "description": "Small label pill above a pill_headline (neutral category word), or null."},
+          "rot": {"type": "number", "minimum": -12, "maximum": 12},
+          "animation": {"enum": ["pop", "slide_left", "slide_right", "fade"]},
+          "start": {"$ref": "#/$defs/time"},
+          "end": {"$ref": "#/$defs/time"},
+          "beat": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "captions": {
+      "type": "object",
+      "required": ["style", "source", "chunks", "fill", "stroke", "scrim"],
+      "additionalProperties": false,
+      "properties": {
+        "style": {"const": "pop_captions"},
+        "source": {"enum": ["asr", "plan"], "description": "asr = the pipeline fills chunks from the speech-timed Hinglish captions (default; the model must not invent spoken words)."},
+        "chunks": {
+          "type": "array", "maxItems": 60,
+          "items": {"type": "object", "required": ["text", "start", "end"], "additionalProperties": false,
+                    "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 60}, "start": {"$ref": "#/$defs/time"}, "end": {"$ref": "#/$defs/time"}}}
+        },
+        "fill": {"$ref": "#/$defs/hex"},
+        "highlight": {"$ref": "#/$defs/hex"},
+        "stroke": {"anyOf": [{"type": "null"}, {"type": "array", "prefixItems": [{"type": "integer", "minimum": 0, "maximum": 14}, {"$ref": "#/$defs/hex"}], "minItems": 2, "maxItems": 2}]},
+        "scrim": {"type": "number", "minimum": 0, "maximum": 0.85, "description": "Opacity of the dark band behind captions; at least 0.35 so they stay legible over saree and hands."}
+      }
+    },
+    "overlays": {
+      "type": "array", "maxItems": 1,
+      "description": "Image overlays (PiP cards). v1: at most one.",
+      "items": {
+        "type": "object",
+        "required": ["id", "src", "region", "size", "rot", "animation", "start", "end"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,23}$"},
+          "src": {"type": "string", "pattern": "^(asset:[^\\s]+|frame:[^\\s@]+@[0-9]+(\\.[0-9]+)?)$", "description": "asset:<name> from the assets list, or frame:<clip>@<seconds>."},
+          "crop": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 4, "maxItems": 4, "description": "x0,y0,x1,y1 in source pixels, optional."},
+          "region": {"enum": ["left_mid", "right_mid"]},
+          "size": {"type": "array", "items": {"type": "integer", "minimum": 120, "maximum": 520}, "minItems": 2, "maxItems": 2},
+          "rot": {"type": "number", "minimum": -12, "maximum": 12},
+          "animation": {"enum": ["pop", "slide_left", "slide_right", "fade"]},
+          "start": {"$ref": "#/$defs/time"},
+          "end": {"$ref": "#/$defs/time"}
+        }
+      }
+    },
+    "audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"source": {"const": "subject"}, "music": {"type": "null"}}
+    },
+    "meta": {
+      "type": "object",
+      "description": "Added by code, not the model: where the plan came from and what was repaired.",
+      "additionalProperties": true
+    }
+  }
+}
