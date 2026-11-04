@@ -981,3 +981,41 @@ def test_subject_luma_measures_masked_pixels_and_probe_has_duration(tmp_path):
     assert ctools.probe_duration(master) == pytest.approx(2.0, abs=0.2)
     lum = ctools.subject_luma(master, matte)
     assert lum is not None and lum == pytest.approx(compose_plan._lum("#808080"), abs=0.04)   # not the white background
+
+
+# ------------------------------------------------------------------ safety net: planned blocks are never dropped
+def test_dropped_planned_block_is_re_added_and_logged(monkeypatch):
+    media = ComposedMedia(textile=False)
+    media.callout = True
+    real = ctools.rescale_to_master
+
+    def dropping(plan, dur):
+        p = real(plan, dur)
+        p["text"] = [t for t in p["text"] if t["role"] != "callout"]     # a pipeline step silently loses the callout
+        return p
+
+    monkeypatch.setattr(ctools, "rescale_to_master", dropping)
+    run, loop = _edit_loop(media)
+    assert media.renders
+    for plan in media.renders:
+        assert any(t["role"] == "callout" and t["text"] == "Pure cotton" for t in plan["text"])
+    ev = [e["payload"] for e in kinds(run, "plan_dropped_block")]
+    assert ev and ev[0]["block"] == "callout"
+    comp = Toolbox(run, media.backends())._read("composition.json")
+    assert any(t["role"] == "callout" for t in comp["plan"]["text"])
+
+
+def test_no_event_when_nothing_dropped():
+    media = ComposedMedia(textile=False)
+    media.callout = True
+    run, loop = _edit_loop(media)
+    assert media.renders and not kinds(run, "plan_dropped_block")
+
+
+def test_readd_planned_blocks_unit():
+    approved = {"text": [{"role": "hook", "text": "H"}, {"role": "callout", "text": "C", "end": 99}, {"role": "caption"}],
+                "duration": 10}
+    plan = {"text": [{"role": "hook", "text": "H"}], "duration": 10}
+    fixed, names = ctools.readd_planned_blocks(approved, plan)
+    assert names == ["callout"] and [t["role"] for t in fixed["text"]] == ["hook", "callout"]
+    assert fixed["text"][1]["end"] == 10 and not ctools.missing_planned_blocks(approved, fixed)

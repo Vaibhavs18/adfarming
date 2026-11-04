@@ -379,6 +379,27 @@ def with_cta_short(plan: dict, concept: dict, human_cta: str | None = None) -> d
     return plan
 
 
+GUARDED_ROLES = ("hook", "callout", "cta")
+
+
+def missing_planned_blocks(approved: dict, plan: dict) -> list[dict]:
+    """Approved-plan text blocks (hook, callout, cta) that are absent from the plan about to be rendered."""
+    have = {t.get("role") for t in plan.get("text") or []}
+    return [t for t in approved.get("text") or [] if t.get("role") in GUARDED_ROLES and t.get("role") not in have]
+
+
+def readd_planned_blocks(approved: dict, plan: dict) -> tuple[dict, list[str]]:
+    """Safety net: put back a planned hook/callout/cta that the pipeline dropped. Returns (plan, names re-added)."""
+    out = copy.deepcopy(plan)
+    names = []
+    for t in missing_planned_blocks(approved, out):
+        b = copy.deepcopy(t)
+        b["end"] = min(b.get("end", out.get("duration", 0)), out.get("duration", b.get("end", 0)))
+        out.setdefault("text", []).append(b)
+        names.append(t.get("role"))
+    return out, names
+
+
 def render_view(plan: dict) -> dict:
     """The plan as handed to the renderer: the cta block shows cta_short, never the raw concept cta field."""
     p = copy.deepcopy(plan)
@@ -883,6 +904,12 @@ class ComposeMixin:
             plan = rescale_to_master(self._cta_pass(plan, wc), probe_duration(master))
             set_head(plan, [mres])
             set_subject_luma(plan, lum)
+        plan, dropped = readd_planned_blocks(base, plan)   # never silently drop a planned hook/callout/cta
+        for name in dropped:
+            self._ev("plan_dropped_block", {"block": name, "action": "re-added before render"}, "system")
+        still = missing_planned_blocks(base, plan)
+        if still:
+            self._ev("plan_dropped_block", {"block": [t.get("role") for t in still], "action": "still missing"}, "system")
         clips = {k: str(_clip_path(v)) for k, v in self._clip_map().items()}
         rassets = {"master": str(master), "matte": mres["matte"], "backdrops": {**plates, **assets["backdrops"]},
                    "pip_images": assets["pips"], "clips": clips}
